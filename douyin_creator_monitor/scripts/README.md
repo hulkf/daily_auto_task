@@ -20,6 +20,7 @@
 
 - `download_douyin_media.py`: 使用已签名的抖音视频/音频 URL 下载样本，并用 FFmpeg 生成 16k 单声道 WAV。
 - `volcengine_asr.py`: 调用火山引擎 ASR 的本地入口，凭证从环境变量读取。
+- `transcribe_douyin_audio_url.py`: 正式转写入口，接收抖音音频 URL，使用临时目录转 WAV 并调用火山 ASR，不保留音视频文件。
 
 火山引擎 ASR 凭证不要写入仓库。建议在本机环境变量或 `douyin_creator_monitor/local/` 下维护：
 
@@ -28,3 +29,5 @@ $env:VOLC_ASR_APP_ID = "..."
 $env:VOLC_ASR_ACCESS_TOKEN = "..."
 $env:VOLC_ASR_CLUSTER = "..."
 ```
+
+正式流程里不需要保存视频或音频。音频 URL 只作为转写输入，临时文件会在脚本结束后自动删除；后续只把文案或摘要写入飞书。

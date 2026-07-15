@@ -65,14 +65,7 @@ def build_payload(audio_path: Path, app_id: str, token: str, cluster: str) -> di
     }
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("audio", help="Path to WAV/M4A audio.")
-    parser.add_argument("--output", help="Where to write the raw ASR JSON.")
-    parser.add_argument("--endpoint", default=os.environ.get("VOLC_ASR_ENDPOINT", DEFAULT_ENDPOINT))
-    args = parser.parse_args()
-
-    audio_path = Path(args.audio)
+def call_asr(audio_path: Path, endpoint: str | None = None) -> str:
     payload = build_payload(
         audio_path=audio_path,
         app_id=env("VOLC_ASR_APP_ID"),
@@ -81,7 +74,7 @@ def main() -> int:
     )
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = Request(
-        args.endpoint,
+        endpoint or os.environ.get("VOLC_ASR_ENDPOINT", DEFAULT_ENDPOINT),
         data=body,
         headers={
             "Authorization": f"Bearer {payload['app']['token']}",
@@ -92,18 +85,63 @@ def main() -> int:
 
     try:
         with urlopen(request, timeout=120) as response:
-            response_text = response.read().decode("utf-8", errors="replace")
+            return response.read().decode("utf-8", errors="replace")
     except HTTPError as exc:
         response_text = exc.read().decode("utf-8", errors="replace")
         raise SystemExit(f"HTTP {exc.code}: {response_text}") from exc
 
+
+def extract_text(response_text: str) -> str:
+    """Best-effort text extraction across common ASR response shapes."""
+    try:
+        payload = json.loads(response_text)
+    except json.JSONDecodeError:
+        return response_text.strip()
+
+    candidates = [
+        payload.get("text"),
+        payload.get("result", {}).get("text") if isinstance(payload.get("result"), dict) else None,
+    ]
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    utterances = None
+    result = payload.get("result")
+    if isinstance(result, dict):
+        utterances = result.get("utterances")
+    if utterances is None:
+        utterances = payload.get("utterances")
+    if isinstance(utterances, list):
+        parts = [item.get("text", "") for item in utterances if isinstance(item, dict)]
+        text = "\n".join(part.strip() for part in parts if part.strip())
+        if text:
+            return text
+
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("audio", help="Path to WAV/M4A audio.")
+    parser.add_argument("--output", help="Where to write the raw ASR JSON.")
+    parser.add_argument("--text-output", help="Where to write extracted transcript text.")
+    parser.add_argument("--endpoint", default=os.environ.get("VOLC_ASR_ENDPOINT", DEFAULT_ENDPOINT))
+    args = parser.parse_args()
+
+    audio_path = Path(args.audio)
+    response_text = call_asr(audio_path, endpoint=args.endpoint)
+    transcript = extract_text(response_text)
+
     if args.output:
         Path(args.output).parent.mkdir(parents=True, exist_ok=True)
         Path(args.output).write_text(response_text, encoding="utf-8")
-    print(response_text)
+    if args.text_output:
+        Path(args.text_output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.text_output).write_text(transcript, encoding="utf-8")
+    print(transcript)
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
