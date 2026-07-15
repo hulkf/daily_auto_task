@@ -14,6 +14,8 @@ secrets/
 **/secrets/
 local/
 **/local/
+*.local.md
+*.local.json
 logs/
 **/logs/
 output/
@@ -25,6 +27,12 @@ cache/
 
 # Locally installed third-party tools
 tools/lark-cli/
+
+# Douyin creator monitor local/private Feishu config
+douyin_creator_monitor/local/
+douyin_creator_monitor/runtime/
+douyin_creator_monitor/**/feishu-ids*.md
+douyin_creator_monitor/**/feishu-ids*.json
 
 # Python
 __pycache__/
