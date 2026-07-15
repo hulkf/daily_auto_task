@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Transcribe a signed Douyin audio URL without keeping media files.
 
-The default strategy asks Volcengine to read the audio URL directly. If that
-fails, the script downloads the audio into a temporary directory, converts it
-to 16 kHz mono WAV, uploads it to Volcengine, and removes the temporary files.
-The only optional outputs are transcript text and raw ASR JSON.
+The default strategy asks Alibaba Cloud Bailian/DashScope Paraformer to read
+the audio URL directly. If that fails, the script can download the audio into
+a temporary directory and call a configured upload command to produce a
+temporary public URL for Paraformer. The only optional outputs are transcript
+text and raw ASR JSON.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import tempfile
 from pathlib import Path
 from urllib.request import Request, urlopen
 
-from volcengine_asr import AsrRequestError, call_asr, call_asr_url, extract_text
+from bailian_paraformer import AsrRequestError, call_asr_url, extract_text
 
 
 def download(url: str, output: Path) -> None:
@@ -55,9 +56,32 @@ def run_ffmpeg(ffmpeg: Path, source: Path, wav_path: Path) -> None:
     )
 
 
-def transcribe_via_download(audio_url: str, ffmpeg: Path, endpoint: str | None) -> str:
+def upload_with_command(upload_command: str, file_path: Path) -> str:
+    if "{file}" not in upload_command:
+        raise AsrRequestError("Upload command must contain a {file} placeholder.")
+    command = upload_command.replace("{file}", str(file_path))
+    completed = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+    uploaded_url = completed.stdout.strip().splitlines()[-1].strip() if completed.stdout.strip() else ""
+    if not uploaded_url.startswith(("http://", "https://")):
+        raise AsrRequestError(f"Upload command did not print a public URL: {uploaded_url}")
+    return uploaded_url
+
+
+def transcribe_via_download(
+    audio_url: str,
+    ffmpeg: Path,
+    endpoint: str | None,
+    upload_command: str,
+    model: str | None,
+) -> str:
     if not str(ffmpeg):
         raise AsrRequestError("FFmpeg path is required for download-upload fallback.")
+    if not upload_command:
+        raise AsrRequestError(
+            "Direct URL transcription failed and no fallback upload command is configured. "
+            "Set BAILIAN_UPLOAD_COMMAND or pass --fallback-upload-command. "
+            "The command must print a temporary public audio URL."
+        )
     with tempfile.TemporaryDirectory(prefix="douyin-asr-") as tmp:
         tmp_dir = Path(tmp)
         audio_path = tmp_dir / "source.m4a"
@@ -65,21 +89,29 @@ def transcribe_via_download(audio_url: str, ffmpeg: Path, endpoint: str | None) 
 
         download(audio_url, audio_path)
         run_ffmpeg(ffmpeg, audio_path, wav_path)
-        return call_asr(wav_path, endpoint=endpoint)
+        uploaded_url = upload_with_command(upload_command, wav_path)
+        return call_asr_url(uploaded_url, endpoint=endpoint, model=model)
 
 
-def transcribe(audio_url: str, ffmpeg: Path, endpoint: str | None, mode: str) -> tuple[str, str]:
+def transcribe(
+    audio_url: str,
+    ffmpeg: Path,
+    endpoint: str | None,
+    mode: str,
+    upload_command: str,
+    model: str | None,
+) -> tuple[str, str]:
     if mode == "direct-url":
-        return call_asr_url(audio_url, endpoint=endpoint), "direct-url"
+        return call_asr_url(audio_url, endpoint=endpoint, model=model), "direct-url"
 
     if mode == "download-upload":
-        return transcribe_via_download(audio_url, ffmpeg, endpoint), "download-upload"
+        return transcribe_via_download(audio_url, ffmpeg, endpoint, upload_command, model), "download-upload"
 
     try:
-        return call_asr_url(audio_url, endpoint=endpoint), "direct-url"
+        return call_asr_url(audio_url, endpoint=endpoint, model=model), "direct-url"
     except AsrRequestError as exc:
         print(f"Direct URL transcription failed, falling back to temporary download: {exc}", file=sys.stderr)
-        return transcribe_via_download(audio_url, ffmpeg, endpoint), "download-upload"
+        return transcribe_via_download(audio_url, ffmpeg, endpoint, upload_command, model), "download-upload"
 
 
 def main() -> int:
@@ -96,9 +128,11 @@ def main() -> int:
         default="auto",
         help="auto tries direct URL first, then falls back to temporary download/upload.",
     )
-    parser.add_argument("--json-output", help="Optional path for raw Volcengine ASR JSON.")
+    parser.add_argument("--fallback-upload-command", default=os.environ.get("BAILIAN_UPLOAD_COMMAND", ""))
+    parser.add_argument("--model", default=os.environ.get("BAILIAN_ASR_MODEL", "paraformer-v2"))
+    parser.add_argument("--json-output", help="Optional path for raw Bailian/DashScope ASR JSON.")
     parser.add_argument("--text-output", help="Optional path for extracted transcript text.")
-    parser.add_argument("--endpoint", help="Override Volcengine ASR endpoint.")
+    parser.add_argument("--endpoint", help="Override Bailian/DashScope ASR endpoint.")
     args = parser.parse_args()
 
     try:
@@ -107,6 +141,8 @@ def main() -> int:
             ffmpeg=Path(args.ffmpeg),
             endpoint=args.endpoint,
             mode=args.mode,
+            upload_command=args.fallback_upload_command,
+            model=args.model,
         )
     except AsrRequestError as exc:
         raise SystemExit(str(exc)) from exc
