@@ -31,6 +31,8 @@ $env:VOLC_ASR_ACCESS_TOKEN = "..."
 $env:VOLC_ASR_CLUSTER = "..."
 ```
 
+火山 AppID/Access Token 已验证需要使用 `Authorization: Bearer; token` 的格式。若返回 `requested resource not granted`，说明当前应用未开通对应语音识别资源，或 `VOLC_ASR_CLUSTER` 与控制台授权资源不匹配。
+
 百炼/DashScope 如果需要保留对比，也可在本机环境变量或 `douyin_creator_monitor/local/bailian.env.json` 下维护：
 
 ```powershell

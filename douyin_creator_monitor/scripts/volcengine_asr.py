@@ -137,7 +137,7 @@ def post_payload(payload: dict, endpoint: str | None = None) -> str:
         endpoint or os.environ.get("VOLC_ASR_ENDPOINT", DEFAULT_ENDPOINT),
         data=body,
         headers={
-            "Authorization": f"Bearer {payload['app']['token']}",
+            "Authorization": f"Bearer; {payload['app']['token']}",
             "Content-Type": "application/json; charset=utf-8",
         },
         method="POST",
