@@ -27,13 +27,32 @@ DEFAULT_MODEL = "paraformer-v2"
 DEFAULT_ENDPOINT = "https://dashscope.aliyuncs.com/api/v1/services/audio/asr/transcription"
 DEFAULT_TASK_ENDPOINT = "https://dashscope.aliyuncs.com/api/v1/tasks"
 TERMINAL_STATUSES = {"SUCCEEDED", "FAILED", "CANCELED", "UNKNOWN"}
+LOCAL_ENV_PATH = Path(__file__).resolve().parents[1] / "local" / "bailian.env.json"
+_LOCAL_ENV_LOADED = False
 
 
 class AsrRequestError(RuntimeError):
     """Raised when Bailian/DashScope returns an HTTP or ASR-level failure."""
 
 
+def load_local_env() -> None:
+    global _LOCAL_ENV_LOADED
+    if _LOCAL_ENV_LOADED:
+        return
+    _LOCAL_ENV_LOADED = True
+    if not LOCAL_ENV_PATH.exists():
+        return
+
+    payload = json.loads(LOCAL_ENV_PATH.read_text(encoding="utf-8-sig"))
+    if not isinstance(payload, dict):
+        raise SystemExit(f"Local config must be a JSON object: {LOCAL_ENV_PATH}")
+    for key, value in payload.items():
+        if isinstance(key, str) and isinstance(value, str) and key not in os.environ:
+            os.environ[key] = value
+
+
 def env(name: str) -> str:
+    load_local_env()
     value = os.environ.get(name, "").strip()
     if not value:
         raise SystemExit(f"Missing required environment variable: {name}")

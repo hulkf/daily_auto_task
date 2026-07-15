@@ -29,6 +29,8 @@ $env:DASHSCOPE_API_KEY = "sk-..."
 $env:BAILIAN_ASR_MODEL = "paraformer-v2"
 ```
 
+脚本也会自动读取被 Git 忽略的本地配置文件：`douyin_creator_monitor/local/bailian.env.json`。
+
 正式流程里不需要保存视频或音频。音频 URL 只作为转写输入：
 
 1. `auto` 模式先把音频 URL 交给百炼 Paraformer 直接读取。
