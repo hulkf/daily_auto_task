@@ -1,0 +1,46 @@
+# Local secrets and environment files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Runtime state, auth cache, and generated artifacts
+runtime/
+**/runtime/
+secrets/
+**/secrets/
+local/
+**/local/
+logs/
+**/logs/
+output/
+**/output/
+tmp/
+**/tmp/
+cache/
+**/cache/
+
+# Locally installed third-party tools
+tools/lark-cli/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS and editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
