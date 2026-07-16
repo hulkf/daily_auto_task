@@ -17,6 +17,7 @@ import hmac
 import json
 import mimetypes
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from urllib.request import Request, urlopen
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MAPPING_PATH = PROJECT_ROOT / "local" / "ima_creator_mapping.json"
 DEFAULT_LOCAL_ENV_PATH = PROJECT_ROOT / "local" / "ima.env.json"
+DEFAULT_COS_UPLOAD_SCRIPT = Path.home() / ".agents" / "skills" / "ima-skill" / "knowledge-base" / "scripts" / "cos-upload.cjs"
 IMA_BASE_URL = "https://ima.qq.com"
 TXT_MEDIA_TYPE = 13
 TXT_SIZE_LIMIT = 10 * 1024 * 1024
@@ -238,7 +240,7 @@ def build_cos_authorization(
     http_headers = "&".join(f"{key}={quote_header_value(headers[key])}" for key in header_keys)
     http_string = f"{method.lower()}\n{pathname}\n\n{http_headers}\n"
     string_to_sign = f"sha1\n{key_time}\n{sha1_hex(http_string)}\n"
-    signature = hmac_sha1_hex(bytes.fromhex(sign_key), string_to_sign)
+    signature = hmac_sha1_hex(sign_key, string_to_sign)
     header_list = ";".join(header_keys)
     return "&".join(
         [
@@ -295,7 +297,41 @@ def upload_to_cos(file_path: Path, credential: dict[str, Any], content_type: str
         detail = exc.read().decode("utf-8", errors="replace")
         raise ImaBackupError(f"COS 上传失败 HTTP {exc.code}: {detail}") from exc
     except URLError as exc:
+        if DEFAULT_COS_UPLOAD_SCRIPT.exists():
+            run_node_cos_upload(file_path, credential, content_type)
+            return
         raise ImaBackupError(f"COS 上传失败: {exc.reason}") from exc
+
+
+def run_node_cos_upload(file_path: Path, credential: dict[str, Any], content_type: str) -> None:
+    command = [
+        "node",
+        str(DEFAULT_COS_UPLOAD_SCRIPT),
+        "--file",
+        str(file_path),
+        "--secret-id",
+        str(credential["secret_id"]),
+        "--secret-key",
+        str(credential["secret_key"]),
+        "--token",
+        str(credential["token"]),
+        "--bucket",
+        str(credential["bucket_name"]),
+        "--region",
+        str(credential["region"]),
+        "--cos-key",
+        str(credential["cos_key"]),
+        "--content-type",
+        content_type,
+        "--start-time",
+        str(credential.get("start_time") or int(time.time())),
+        "--expired-time",
+        str(credential.get("expired_time") or int(time.time()) + 3600),
+    ]
+    result = subprocess.run(command, check=False, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise ImaBackupError(f"COS 上传失败: {detail}")
 
 
 def upload_file(credentials: ImaCredentials, target: CreatorTarget, file_path: Path, on_duplicate: str) -> str | None:
