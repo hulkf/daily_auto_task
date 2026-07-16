@@ -54,3 +54,7 @@ $env:BAILIAN_ASR_MODEL = "paraformer-v2"
 ```powershell
 $env:BAILIAN_UPLOAD_COMMAND = "your-upload-command --file {file}"
 ```
+
+## IMA 备份脚本
+
+- `backup_transcripts_to_ima.py`: 把本地 `.txt` 文案按“博主 -> IMA 知识库/文件夹”映射备份到腾讯 IMA。真实凭证和映射文件放在 `douyin_creator_monitor/local/`，提交到 Git 的只有模板和说明。

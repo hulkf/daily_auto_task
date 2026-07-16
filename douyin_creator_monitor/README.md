@@ -40,3 +40,7 @@ douyin_creator_monitor/local/feishu-ids.md
 - `scripts/`: 后续沉淀的可复用脚本。当前主要流程仍是手动验证和 CLI 命令组合。
 
 从现在开始，这个项目新增的脚本、说明、模板、测试 JSON 和临时产物都放在 `douyin_creator_monitor/` 目录下，不再散落到仓库根目录。
+
+## IMA 文案备份
+
+火山 ASR 得到的 `.txt` 文案可以先保存到本地，再用 `scripts/backup_transcripts_to_ima.py` 备份到腾讯 IMA。博主和 IMA 知识库/文件夹的映射关系放在 `douyin_creator_monitor/local/ima_creator_mapping.json`，模板见 `config/ima_creator_mapping.example.json`。具体步骤见 `docs/ima-backup.md`。
