@@ -30,13 +30,7 @@ def main() -> int:
     parser.add_argument("--feishu-base-token")
     parser.add_argument("--feishu-lark-cli")
     parser.add_argument("--feishu-work-id-field", default="抖音作品ID")
-    parser.add_argument("--feishu-transcript-field", default="转写文案")
-    parser.add_argument("--feishu-corrected-transcript-field", default="词库纠错文案")
-    parser.add_argument("--feishu-status-field", default="转写状态")
-    parser.add_argument("--feishu-status", default="已完成")
-    parser.add_argument("--feishu-completed-at-field", default="转写完成时间")
-    parser.add_argument("--feishu-raw-json-field", default="转写原始结果")
-    parser.add_argument("--feishu-correction-report-field", default="转写纠错报告")
+    parser.add_argument("--feishu-transcript-field", default="语音转写全文")
     parser.add_argument("--feishu-dry-run", action="store_true")
     args = parser.parse_args()
 
@@ -96,17 +90,7 @@ def main() -> int:
                 transcript_file=None,
                 corrected_transcript=corrected,
                 corrected_transcript_file=None,
-                raw_json=response_text,
-                raw_json_file=None,
-                correction_report=json.dumps(correction_report, ensure_ascii=False) if correction_report else "",
-                correction_report_file=None,
                 transcript_field=args.feishu_transcript_field,
-                corrected_transcript_field=args.feishu_corrected_transcript_field,
-                raw_json_field=args.feishu_raw_json_field,
-                correction_report_field=args.feishu_correction_report_field,
-                status_field=args.feishu_status_field,
-                status=args.feishu_status,
-                completed_at_field=args.feishu_completed_at_field,
             )
             cli = feishu_transcript_writer.resolve_lark_cli(args.feishu_lark_cli)
             base_token = feishu_transcript_writer.load_base_token(args.feishu_base_token)

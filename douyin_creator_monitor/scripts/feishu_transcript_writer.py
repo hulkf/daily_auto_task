@@ -8,7 +8,6 @@ import json
 import os
 import re
 import subprocess
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -174,26 +173,12 @@ def redact_value(value: Any, base_token: str) -> Any:
 def build_patch(args: argparse.Namespace) -> dict[str, Any]:
     transcript = read_text_arg(args.transcript, args.transcript_file)
     corrected = read_text_arg(args.corrected_transcript, args.corrected_transcript_file)
-    raw_json = read_text_arg(args.raw_json, args.raw_json_file)
-    correction_report = read_text_arg(args.correction_report, args.correction_report_file)
+    final_text = corrected or transcript
 
-    if not transcript and not corrected:
+    if not final_text:
         raise SystemExit("Nothing to write. Pass --transcript/--transcript-file or --corrected-transcript/--corrected-transcript-file.")
 
-    patch: dict[str, Any] = {}
-    if transcript:
-        patch[args.transcript_field] = transcript
-    if corrected:
-        patch[args.corrected_transcript_field] = corrected
-    if raw_json and args.raw_json_field:
-        patch[args.raw_json_field] = raw_json
-    if correction_report and args.correction_report_field:
-        patch[args.correction_report_field] = correction_report
-    if args.status_field:
-        patch[args.status_field] = args.status
-    if args.completed_at_field:
-        patch[args.completed_at_field] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return patch
+    return {args.transcript_field: final_text}
 
 
 def main() -> int:
@@ -216,13 +201,7 @@ def main() -> int:
     parser.add_argument("--correction-report")
     parser.add_argument("--correction-report-file")
 
-    parser.add_argument("--transcript-field", default="转写文案")
-    parser.add_argument("--corrected-transcript-field", default="词库纠错文案")
-    parser.add_argument("--raw-json-field", default="转写原始结果")
-    parser.add_argument("--correction-report-field", default="转写纠错报告")
-    parser.add_argument("--status-field", default="转写状态")
-    parser.add_argument("--status", default="已完成")
-    parser.add_argument("--completed-at-field", default="转写完成时间")
+    parser.add_argument("--transcript-field", default="语音转写全文")
     args = parser.parse_args()
 
     cli = resolve_lark_cli(args.lark_cli)
