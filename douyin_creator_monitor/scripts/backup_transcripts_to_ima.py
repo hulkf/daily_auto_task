@@ -55,7 +55,7 @@ class CreatorTarget:
 
 def load_json(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError as exc:
         raise ImaBackupError(f"配置文件不存在: {path}") from exc
     except json.JSONDecodeError as exc:
@@ -121,8 +121,14 @@ def ima_api(credentials: ImaCredentials, path: str, body: dict[str, Any]) -> dic
     except json.JSONDecodeError as exc:
         raise ImaBackupError(f"IMA 返回了非 JSON 响应: {raw[:300]}") from exc
 
-    if result.get("retcode") != 0:
-        raise ImaBackupError(str(result.get("errmsg") or result))
+    if "retcode" in result:
+        success = result.get("retcode") == 0
+        error_message = result.get("errmsg")
+    else:
+        success = result.get("code") == 0
+        error_message = result.get("msg")
+    if not success:
+        raise ImaBackupError(str(error_message or result))
     data = result.get("data")
     return data if isinstance(data, dict) else {}
 
@@ -344,14 +350,16 @@ def iter_files(input_dir: Path, pattern: str) -> list[Path]:
 
 
 def list_knowledge_bases(credentials: ImaCredentials) -> None:
-    data = ima_api(credentials, "openapi/wiki/v1/search_knowledge_base", {"query": "", "cursor": "", "limit": 50})
+    data = ima_api(credentials, "openapi/wiki/v1/search_knowledge_base", {"query": "", "cursor": "", "limit": 20})
     items = data.get("info_list") or data.get("knowledge_base_list") or []
     if not isinstance(items, list) or not items:
         print("没有查到可见的 IMA 知识库。")
         return
     for item in items:
         if isinstance(item, dict):
-            print(f"{item.get('name', '')}\t{item.get('id', '')}")
+            name = item.get("name") or item.get("kb_name") or ""
+            kb_id = item.get("id") or item.get("kb_id") or ""
+            print(f"{name}\t{kb_id}")
 
 
 def search_folder(credentials: ImaCredentials, knowledge_base_id: str, query: str) -> None:
