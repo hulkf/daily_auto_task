@@ -102,3 +102,21 @@ python .\douyin_creator_monitor\scripts\backup_transcripts_to_ima.py upload-dir 
 ```
 
 同名文件默认会追加时间戳保留两份；也可以用 `--on-duplicate skip` 跳过，或用 `--on-duplicate fail` 直接报错。
+## 与飞书达人基础信息表的关系
+
+飞书「达人基础信息表」是后续自动化的主索引。IMA 的知识库和文件夹信息会回填到达人记录中：
+
+- `IMA知识库名称`
+- `IMA知识库ID`
+- `IMA文件夹名称`
+- `IMA文件夹ID`
+- `IMA同步状态`
+
+后续上传文案时，优先从达人基础信息表读取该达人对应的 IMA 目标；`local/ima_creator_mapping.json` 可以作为本地缓存或手动兜底映射。
+
+当前已确认：
+
+- 「知了-千川推商品」对应 IMA 文件夹「知了」
+- 「糯米爸(付费流分享)」对应 IMA 文件夹「糯米爸」
+
+新增达人时，除了创建飞书作品表，也需要在 IMA「李建荣的知识库」中创建或定位同名文件夹，并把文件夹信息回填到达人基础信息表。当前 IMA OpenAPI 支持定位和上传到已有文件夹；公开文档暂未提供创建知识库文件夹接口，因此新文件夹如无法通过 API 创建，需要先在 IMA 中创建，再回填 `IMA文件夹ID`。
