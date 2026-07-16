@@ -23,6 +23,7 @@
 - `bailian_paraformer.py`: 调用阿里云百炼/DashScope Paraformer 的本地入口，凭证从环境变量读取。
 - `transcribe_douyin_audio_url.py`: 正式转写入口，接收抖音音频 URL，默认使用火山引擎；百炼 Paraformer 仅作为低成本备选。
 - `feishu_transcript_writer.py`: 按 `抖音作品ID` 定位飞书作品表记录，并把词库纠正后的最终文案写回 `语音转写全文` 字段。
+- `sync_douyin_works_to_feishu.py`: 读取 Crawlio 从 `/aweme/v1/web/aweme/post/` 捕获并规范化后的作品 JSON，按 `抖音作品ID` 覆盖更新飞书作品表；只新增和更新，不删除飞书中已存在但本轮未抓到的历史记录。
 
 火山引擎凭证不要写入仓库。建议在本机环境变量或 `douyin_creator_monitor/local/volcengine.env.json` 下维护：
 
