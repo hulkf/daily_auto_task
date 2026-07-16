@@ -47,8 +47,10 @@ douyin_creator_monitor/local/volcengine.env.json
 
 1. 临时下载音频。
 2. 用 FFmpeg 转成 16k 单声道 WAV。
-3. 上传到临时公网文件服务，拿到可下载 URL。
+3. 上传到火山 TOS，拿到短期预签名 URL。
 4. 再提交给火山 ASR。
+
+TOS 上传与清理见 `docs/volcengine-tos.md`。
 
 ## 运行入口
 
@@ -65,4 +67,3 @@ python douyin_creator_monitor/scripts/transcribe_douyin_audio_url.py `
 ```powershell
 $env:VOLC_UPLOAD_COMMAND = "your-upload-command --file {file}"
 ```
-
