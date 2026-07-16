@@ -22,6 +22,7 @@
 - `volcengine_asr.py`: 调用火山引擎 ASR 的本地入口，凭证从环境变量或本地忽略配置读取。
 - `bailian_paraformer.py`: 调用阿里云百炼/DashScope Paraformer 的本地入口，凭证从环境变量读取。
 - `transcribe_douyin_audio_url.py`: 正式转写入口，接收抖音音频 URL，默认使用火山引擎；百炼 Paraformer 仅作为低成本备选。
+- `feishu_transcript_writer.py`: 按 `抖音作品ID` 定位飞书作品表记录，并把转写文案、纠错文案、状态和完成时间写回对应记录。
 
 火山引擎凭证不要写入仓库。建议在本机环境变量或 `douyin_creator_monitor/local/volcengine.env.json` 下维护：
 

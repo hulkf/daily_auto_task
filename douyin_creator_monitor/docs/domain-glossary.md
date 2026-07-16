@@ -59,3 +59,30 @@ python douyin_creator_monitor/scripts/correct_transcript.py `
 
 候选词会进入 `candidate_terms`，状态为 `pending`。确认后再移动到对应 domain 的 `hotwords` 或 `replacements`。
 
+## 回写飞书作品记录
+
+单独把已经生成的文案写回飞书：
+
+```powershell
+python douyin_creator_monitor/scripts/feishu_transcript_writer.py `
+  --table-id "<达人作品表ID>" `
+  --work-id "<抖音作品ID>" `
+  --transcript-file douyin_creator_monitor/runtime/media/<作品ID>.volc-tos.txt `
+  --corrected-transcript-file douyin_creator_monitor/runtime/media/<作品ID>.corrected.txt `
+  --correction-report-file douyin_creator_monitor/runtime/media/<作品ID>.correction-report.json
+```
+
+转写完成后自动回写：
+
+```powershell
+python douyin_creator_monitor/scripts/transcribe_tos_audio_file.py `
+  douyin_creator_monitor/runtime/media/<作品ID>.16k.wav `
+  --text-output douyin_creator_monitor/runtime/media/<作品ID>.volc-tos.txt `
+  --corrected-text-output douyin_creator_monitor/runtime/media/<作品ID>.corrected.txt `
+  --correction-report-output douyin_creator_monitor/runtime/media/<作品ID>.correction-report.json `
+  --correction-domain douyin_shop_ads `
+  --feishu-table-id "<达人作品表ID>" `
+  --feishu-work-id "<抖音作品ID>"
+```
+
+脚本默认读取本地忽略文件 `douyin_creator_monitor/local/feishu-ids.md` 中的 `base_token`，也可以通过 `FEISHU_BASE_TOKEN` 或 `--base-token` 传入。

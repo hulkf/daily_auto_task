@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 
 import correct_transcript
+import feishu_transcript_writer
 import volcengine_asr
 import volcengine_tos
 
@@ -24,6 +25,19 @@ def main() -> int:
     parser.add_argument("--glossary", default=str(correct_transcript.DEFAULT_GLOSSARY_PATH))
     parser.add_argument("--upload-json-output", help="Optional path for TOS upload metadata.")
     parser.add_argument("--url-expires", type=int, help="Pre-signed TOS URL expiry in seconds.")
+    parser.add_argument("--feishu-table-id", help="Optional creator-specific Feishu work table ID to write transcript back.")
+    parser.add_argument("--feishu-work-id", help="Douyin work/video ID used to locate the Feishu record.")
+    parser.add_argument("--feishu-base-token")
+    parser.add_argument("--feishu-lark-cli")
+    parser.add_argument("--feishu-work-id-field", default="抖音作品ID")
+    parser.add_argument("--feishu-transcript-field", default="转写文案")
+    parser.add_argument("--feishu-corrected-transcript-field", default="词库纠错文案")
+    parser.add_argument("--feishu-status-field", default="转写状态")
+    parser.add_argument("--feishu-status", default="已完成")
+    parser.add_argument("--feishu-completed-at-field", default="转写完成时间")
+    parser.add_argument("--feishu-raw-json-field", default="转写原始结果")
+    parser.add_argument("--feishu-correction-report-field", default="转写纠错报告")
+    parser.add_argument("--feishu-dry-run", action="store_true")
     args = parser.parse_args()
 
     object_key = ""
@@ -39,6 +53,8 @@ def main() -> int:
 
         response_text = volcengine_asr.call_asr_url(audio_url)
         transcript = volcengine_asr.extract_text(response_text)
+        corrected = ""
+        correction_report = {}
 
         if args.json_output:
             Path(args.json_output).parent.mkdir(parents=True, exist_ok=True)
@@ -46,7 +62,7 @@ def main() -> int:
         if args.text_output:
             Path(args.text_output).parent.mkdir(parents=True, exist_ok=True)
             Path(args.text_output).write_text(transcript, encoding="utf-8")
-        if args.corrected_text_output or args.correction_report_output:
+        if args.corrected_text_output or args.correction_report_output or args.feishu_table_id:
             glossary_path = Path(args.glossary)
             glossary = correct_transcript.load_glossary(glossary_path)
             replacements = correct_transcript.collect_replacements(
@@ -61,17 +77,56 @@ def main() -> int:
             if args.corrected_text_output:
                 Path(args.corrected_text_output).parent.mkdir(parents=True, exist_ok=True)
                 Path(args.corrected_text_output).write_text(corrected, encoding="utf-8")
+            correction_report = {
+                "glossary": str(glossary_path),
+                "changes": changes,
+                "candidate_terms": candidates,
+            }
             if args.correction_report_output:
-                report = {
-                    "glossary": str(glossary_path),
-                    "changes": changes,
-                    "candidate_terms": candidates,
-                }
                 Path(args.correction_report_output).parent.mkdir(parents=True, exist_ok=True)
                 Path(args.correction_report_output).write_text(
-                    json.dumps(report, ensure_ascii=False, indent=2),
+                    json.dumps(correction_report, ensure_ascii=False, indent=2),
                     encoding="utf-8",
                 )
+        if args.feishu_table_id or args.feishu_work_id:
+            if not args.feishu_table_id or not args.feishu_work_id:
+                raise SystemExit("--feishu-table-id and --feishu-work-id must be used together.")
+            feishu_args = argparse.Namespace(
+                transcript=transcript,
+                transcript_file=None,
+                corrected_transcript=corrected,
+                corrected_transcript_file=None,
+                raw_json=response_text,
+                raw_json_file=None,
+                correction_report=json.dumps(correction_report, ensure_ascii=False) if correction_report else "",
+                correction_report_file=None,
+                transcript_field=args.feishu_transcript_field,
+                corrected_transcript_field=args.feishu_corrected_transcript_field,
+                raw_json_field=args.feishu_raw_json_field,
+                correction_report_field=args.feishu_correction_report_field,
+                status_field=args.feishu_status_field,
+                status=args.feishu_status,
+                completed_at_field=args.feishu_completed_at_field,
+            )
+            cli = feishu_transcript_writer.resolve_lark_cli(args.feishu_lark_cli)
+            base_token = feishu_transcript_writer.load_base_token(args.feishu_base_token)
+            record_id = feishu_transcript_writer.find_record_by_work_id(
+                cli,
+                base_token,
+                args.feishu_table_id,
+                args.feishu_work_id,
+                args.feishu_work_id_field,
+                "user",
+            )
+            feishu_transcript_writer.write_transcript(
+                cli,
+                base_token,
+                args.feishu_table_id,
+                record_id,
+                feishu_transcript_writer.build_patch(feishu_args),
+                "user",
+                dry_run=args.feishu_dry_run,
+            )
 
         print(transcript)
         return 0
