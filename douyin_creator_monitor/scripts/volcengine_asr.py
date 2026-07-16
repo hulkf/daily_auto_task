@@ -29,6 +29,7 @@ V3_SUBMIT_ENDPOINT = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submi
 V3_QUERY_ENDPOINT = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
 V3_RESOURCE_ID = "volc.seedasr.auc"
 LOCAL_ENV_PATH = Path(__file__).resolve().parents[1] / "local" / "volcengine.env.json"
+DEFAULT_GLOSSARY_PATH = Path(__file__).resolve().parents[1] / "config" / "domain_glossary.json"
 SUCCESS_CODES = {0, 1000, 20000000}
 PENDING_CODES = {20000001, 20000002}
 _LOCAL_ENV_LOADED = False
@@ -91,6 +92,42 @@ def build_base_payload(app_id: str, token: str, cluster: str) -> dict:
 def infer_url_format(audio_url: str) -> str:
     suffix = Path(urlparse(audio_url).path).suffix.lower().lstrip(".")
     return suffix or "m4a"
+
+
+def load_glossary_context(glossary_path: Path | None = None) -> str:
+    path = glossary_path or Path(optional_env("DOUYIN_GLOSSARY_PATH") or DEFAULT_GLOSSARY_PATH)
+    if not path.exists():
+        return ""
+
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    domains = payload.get("domains", []) if isinstance(payload, dict) else []
+    hotwords: list[str] = []
+    for domain in domains:
+        if not isinstance(domain, dict):
+            continue
+        for word in domain.get("hotwords", []):
+            if isinstance(word, str) and word.strip() and word.strip() not in hotwords:
+                hotwords.append(word.strip())
+
+    max_words = int(optional_env("DOUYIN_ASR_CONTEXT_WORD_LIMIT") or "160")
+    selected = hotwords[:max_words]
+    if not selected:
+        return ""
+    return json.dumps(
+        {
+            "context_type": "dialog_ctx",
+            "context_data": [
+                {
+                    "text": (
+                        "这是一段短视频行业监控音频，可能涉及抖店投放、巨量千川、"
+                        "乘方广告、巨量引擎、AI 产品、AI 模型和行业资讯。"
+                    )
+                },
+                {"text": "优先按以下专业词识别：" + "、".join(selected)},
+            ],
+        },
+        ensure_ascii=False,
+    )
 
 
 def build_file_payload(audio_path: Path, app_id: str, token: str, cluster: str) -> dict:
@@ -165,6 +202,15 @@ def post_payload(payload: dict, endpoint: str | None = None) -> str:
 
 
 def build_v3_url_payload(audio_url: str) -> dict:
+    request_payload = {
+        "model_name": "bigmodel",
+        "enable_itn": True,
+        "show_utterances": True,
+    }
+    context = load_glossary_context()
+    if context:
+        request_payload["context"] = context
+
     return {
         "user": {
             "uid": "douyin_creator_monitor",
@@ -173,11 +219,7 @@ def build_v3_url_payload(audio_url: str) -> dict:
             "format": infer_url_format(audio_url),
             "url": audio_url,
         },
-        "request": {
-            "model_name": "bigmodel",
-            "enable_itn": True,
-            "show_utterances": True,
-        },
+        "request": request_payload,
     }
 
 
