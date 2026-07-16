@@ -16,16 +16,21 @@ import argparse
 import base64
 import json
 import os
+import time
 import uuid
 from pathlib import Path
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
 DEFAULT_ENDPOINT = "https://openspeech.bytedance.com/api/v1/asr"
+V3_SUBMIT_ENDPOINT = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/submit"
+V3_QUERY_ENDPOINT = "https://openspeech.bytedance.com/api/v3/auc/bigmodel/query"
+V3_RESOURCE_ID = "volc.seedasr.auc"
 LOCAL_ENV_PATH = Path(__file__).resolve().parents[1] / "local" / "volcengine.env.json"
 SUCCESS_CODES = {0, 1000, 20000000}
+PENDING_CODES = {20000001, 20000002}
 _LOCAL_ENV_LOADED = False
 
 
@@ -55,6 +60,11 @@ def env(name: str) -> str:
     if not value:
         raise SystemExit(f"Missing required environment variable: {name}")
     return value
+
+
+def optional_env(name: str) -> str:
+    load_local_env()
+    return os.environ.get(name, "").strip()
 
 
 def build_base_payload(app_id: str, token: str, cluster: str) -> dict:
@@ -154,6 +164,90 @@ def post_payload(payload: dict, endpoint: str | None = None) -> str:
     return response_text
 
 
+def build_v3_url_payload(audio_url: str) -> dict:
+    return {
+        "user": {
+            "uid": "douyin_creator_monitor",
+        },
+        "audio": {
+            "format": infer_url_format(audio_url),
+            "url": audio_url,
+        },
+        "request": {
+            "model_name": "bigmodel",
+            "enable_itn": True,
+            "show_utterances": True,
+        },
+    }
+
+
+def v3_headers(api_key: str, task_id: str, sequence: str | None = None) -> dict:
+    headers = {
+        "X-Api-Key": api_key,
+        "X-Api-Resource-Id": optional_env("VOLC_ASR_RESOURCE_ID") or V3_RESOURCE_ID,
+        "X-Api-Request-Id": task_id,
+        "Content-Type": "application/json; charset=utf-8",
+    }
+    if sequence is not None:
+        headers["X-Api-Sequence"] = sequence
+    return headers
+
+
+def post_v3(endpoint: str, headers: dict, payload: dict) -> tuple[int, str, str]:
+    request = Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=120) as response:
+            status_code = int(response.headers.get("X-Api-Status-Code", response.status))
+            message = response.headers.get("X-Api-Message", "")
+            response_text = response.read().decode("utf-8", errors="replace")
+    except HTTPError as exc:
+        response_text = exc.read().decode("utf-8", errors="replace")
+        status_code = int(exc.headers.get("X-Api-Status-Code", exc.code))
+        message = exc.headers.get("X-Api-Message", "")
+        raise AsrRequestError(f"HTTP {exc.code}, ASR code {status_code}: {message or response_text}") from exc
+    return status_code, message, response_text
+
+
+def call_asr_url_v3(audio_url: str, submit_endpoint: str | None = None, query_endpoint: str | None = None) -> str:
+    api_key = env("VOLC_ASR_API_KEY")
+    task_id = str(uuid.uuid4())
+    submit_status, submit_message, _ = post_v3(
+        submit_endpoint or optional_env("VOLC_ASR_V3_SUBMIT_ENDPOINT") or V3_SUBMIT_ENDPOINT,
+        headers=v3_headers(api_key, task_id, sequence="-1"),
+        payload=build_v3_url_payload(audio_url),
+    )
+    if submit_status != 20000000:
+        raise AsrRequestError(f"ASR submit code {submit_status}: {submit_message}")
+
+    query_url = query_endpoint or optional_env("VOLC_ASR_V3_QUERY_ENDPOINT") or V3_QUERY_ENDPOINT
+    last_message = ""
+    for _ in range(int(optional_env("VOLC_ASR_QUERY_ATTEMPTS") or "60")):
+        try:
+            status_code, message, response_text = post_v3(
+                query_url,
+                headers=v3_headers(api_key, task_id),
+                payload={},
+            )
+        except URLError as exc:
+            last_message = str(exc)
+            time.sleep(float(optional_env("VOLC_ASR_QUERY_INTERVAL_SECONDS") or "2"))
+            continue
+        last_message = message
+        if status_code == 20000000:
+            ensure_success_response(response_text)
+            return response_text
+        if status_code not in PENDING_CODES:
+            raise AsrRequestError(f"ASR query code {status_code}: {message or response_text}")
+        time.sleep(float(optional_env("VOLC_ASR_QUERY_INTERVAL_SECONDS") or "2"))
+
+    raise AsrRequestError(f"ASR query timed out: {last_message or 'task still pending'}")
+
+
 def call_asr(audio_path: Path, endpoint: str | None = None) -> str:
     payload = build_file_payload(
         audio_path=audio_path,
@@ -165,6 +259,9 @@ def call_asr(audio_path: Path, endpoint: str | None = None) -> str:
 
 
 def call_asr_url(audio_url: str, endpoint: str | None = None) -> str:
+    if optional_env("VOLC_ASR_API_KEY"):
+        return call_asr_url_v3(audio_url, submit_endpoint=endpoint)
+
     payload = build_url_payload(
         audio_url=audio_url,
         app_id=env("VOLC_ASR_APP_ID"),

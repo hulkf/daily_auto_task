@@ -83,6 +83,15 @@ def transcribe_via_download(
         download(audio_url, audio_path)
         run_ffmpeg(ffmpeg, audio_path, wav_path)
         if provider == "volcengine":
+            if volcengine_asr.optional_env("VOLC_ASR_API_KEY"):
+                if not upload_command:
+                    raise RuntimeError(
+                        "Volcengine ASR 2.0 needs a public audio URL. "
+                        "Set VOLC_UPLOAD_COMMAND or BAILIAN_UPLOAD_COMMAND, "
+                        "or pass --fallback-upload-command."
+                    )
+                uploaded_url = upload_with_command(upload_command, wav_path)
+                return volcengine_asr.call_asr_url(uploaded_url, endpoint=endpoint)
             return volcengine_asr.call_asr(wav_path, endpoint=endpoint)
 
         if not upload_command:
@@ -148,7 +157,10 @@ def main() -> int:
         default="auto",
         help="auto tries direct URL first, then falls back to temporary download/upload.",
     )
-    parser.add_argument("--fallback-upload-command", default=os.environ.get("BAILIAN_UPLOAD_COMMAND", ""))
+    parser.add_argument(
+        "--fallback-upload-command",
+        default=os.environ.get("VOLC_UPLOAD_COMMAND", os.environ.get("BAILIAN_UPLOAD_COMMAND", "")),
+    )
     parser.add_argument("--model", default=os.environ.get("BAILIAN_ASR_MODEL", "paraformer-v2"))
     parser.add_argument("--json-output", help="Optional path for raw ASR JSON.")
     parser.add_argument("--text-output", help="Optional path for extracted transcript text.")
