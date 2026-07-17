@@ -268,7 +268,11 @@ def load_records_from_output(root: Path) -> tuple[list[dict[str, Any]], list[Pat
     used_files: list[Path] = []
     for path in candidate_files(root):
         name = path.name.lower()
-        if not any(token in name for token in ("douyin", "dy", "aweme", "note", "works")):
+        # MediaCrawler's official Douyin JSONL writer stores creator works as
+        # ``douyin/jsonl/creator_contents_YYYY-MM-DD.jsonl``.  The file name
+        # does not contain ``douyin`` or ``aweme``, so keep ``contents`` here
+        # and rely on normalize_record() to reject non-Douyin rows.
+        if not any(token in name for token in ("douyin", "dy", "aweme", "note", "works", "contents")):
             continue
         try:
             if path.suffix.lower() == ".jsonl":

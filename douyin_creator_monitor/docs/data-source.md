@@ -65,6 +65,14 @@ is_top -> 是否置顶
 
 适配层默认要求 MediaCrawler 以 `jsonl` 保存，兼容 `json` 和 `csv`。调用时会显式传入 MediaCrawler 官方 CLI 参数：`--platform dy`、`--type creator`、`--creator_id`、`--crawler_max_notes_count`、`--save_data_option`、`--save_data_path`。
 
+MediaCrawler 的 Douyin JSONL 写入器会在传入的 `--save_data_path` 下继续创建平台和格式子目录。达人作品的真实文件通常是：
+
+```text
+douyin_creator_monitor/runtime/mediacrawler-output/douyin/jsonl/creator_contents_YYYY-MM-DD.jsonl
+```
+
+不要只扫描 `mediacrawler-output/` 顶层；适配层必须递归读取该目录，并允许 `creator_contents_*.jsonl` 这类文件名。是否为抖音作品由记录内容规范化校验决定，而不是只靠文件名里的 `douyin` 或 `aweme` 判断。
+
 适配层会兼容 MediaCrawler 常见等价字段，例如 `liked_count`、`collected_count`、`aweme_url`，也兼容抖音原始接口里的 `statistics.digg_count/comment_count/collect_count/share_count`。
 
 正式写入飞书前必须先完成核心字段校验。缺少发布时间或互动数据时，不能把任务报告为完成，也不能用空值覆盖飞书历史数据。

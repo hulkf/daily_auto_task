@@ -37,6 +37,8 @@ python douyin_creator_monitor\scripts\collect_douyin_creator_with_mediacrawler.p
 
 如果 `D:\path\to\MediaCrawler\.venv\Scripts\python.exe` 存在，脚本会自动使用这个虚拟环境运行 MediaCrawler；也可以用 `MEDIACRAWLER_PYTHON` 或 `--media-crawler-python` 手动指定。
 
+MediaCrawler 的实际原始 JSONL 不是写在输出目录顶层，而是在 `runtime/mediacrawler-output/douyin/jsonl/creator_contents_YYYY-MM-DD.jsonl`。后续排障时要优先检查这个文件；其中点赞/收藏字段可能已经被 MediaCrawler 转成 `liked_count`、`collected_count`，适配脚本会统一规范化回 `digg_count`、`collect_count` 后再同步飞书。
+
 采集完成后写入飞书：
 
 ```powershell
