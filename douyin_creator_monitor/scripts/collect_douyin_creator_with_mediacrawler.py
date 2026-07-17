@@ -341,7 +341,7 @@ def write_payload(payload: dict[str, Any], output_file: Path) -> None:
 def run_mediacrawler(args: argparse.Namespace) -> None:
     media_dir = resolve_media_crawler_dir(args.media_crawler_dir)
 
-    output_dir = Path(args.media_output_dir)
+    output_dir = Path(args.media_output_dir).expanduser().resolve()
     if args.clean_media_output and output_dir.exists():
         resolved_output = output_dir.resolve()
         resolved_runtime = RUNTIME_DIR.resolve()
@@ -390,7 +390,7 @@ def collect(args: argparse.Namespace) -> dict[str, Any]:
     if not args.normalize_only:
         run_mediacrawler(args)
 
-    records, used_files = load_records_from_output(Path(args.media_output_dir))
+    records, used_files = load_records_from_output(Path(args.media_output_dir).expanduser().resolve())
     if not records:
         try:
             media_dir = resolve_media_crawler_dir(args.media_crawler_dir)
