@@ -22,7 +22,7 @@ from typing import Any
 
 REPO_DIR = Path(__file__).resolve().parents[2]
 PROJECT_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_WORKS_FILE = PROJECT_DIR / "runtime" / "zhiliao-works-from-crawlio.json"
+DEFAULT_WORKS_FILE = PROJECT_DIR / "runtime" / "zhiliao-works-from-mediacrawler.json"
 DEFAULT_LARK_CLI = REPO_DIR / "tools" / "lark-cli" / "lark-cli.exe"
 BEIJING_TZ = timezone(timedelta(hours=8))
 HASHTAG_RE = re.compile(r"#([^#\s]+)")

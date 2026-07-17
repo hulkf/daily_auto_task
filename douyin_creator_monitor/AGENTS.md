@@ -20,7 +20,8 @@
 ## 作品入库必填数据
 
 - 正式抓取并写入飞书作品表时，每条作品必须包含：`发布时间`、`点赞数`、`评论数`、`收藏数`、`分享数`。这些是核心数据，不得在正式同步中跳过。
-- 上述数据必须优先从项目已验证的抖音作品列表接口 `/aweme/v1/web/aweme/post/` 获取：`create_time` 映射为发布时间，`statistics.digg_count/comment_count/collect_count/share_count` 分别映射为点赞、评论、收藏、分享数。
+- 上述数据必须优先通过 MediaCrawler 抓取抖音达人作品，并由 `scripts/collect_douyin_creator_with_mediacrawler.py` 规范化为本项目统一作品 JSON。底层仍应来自抖音作品列表数据：`create_time` 映射为发布时间，`statistics.digg_count/comment_count/collect_count/share_count` 或 MediaCrawler 等价字段分别映射为点赞、评论、收藏、分享数。
+- Crawlio/Chrome 响应捕获只作为排障兜底或验证来源；默认采集链路应使用 MediaCrawler 项目框架。
 - 主页卡片 DOM 只可用于发现作品或辅助校验，不得作为正式作品入库的唯一数据源。
 - 正式同步必须在写入后做完整性校验；任一当前可见作品缺少上述核心字段时，不得将该轮任务报告为“已完成”，应继续补抓或明确报告异常。
 - 对旧记录进行覆盖更新时，新抓到的完整核心数据可以更新对应字段；本轮未取到的核心值仍不得用空值覆盖历史值。

@@ -12,14 +12,16 @@
 
 ## 当前状态
 
-已跑通的链路：
+当前主链路：
 
 1. 从飞书“达人基础信息表”读取新增达人主页链接。
-2. 使用 Chrome 登录态打开抖音达人主页。
-3. 从主页列表接口 `/aweme/v1/web/aweme/post/` 获取作品列表数据。
+2. 调用本机 MediaCrawler 项目框架抓取抖音达人作品。
+3. 将 MediaCrawler 导出的作品数据规范化为本项目统一 JSON：`runtime/zhiliao-works-from-mediacrawler.json`。
 4. 新建该达人专属作品表。
-5. 写入样本作品记录。
+5. 用 `抖音作品ID` 做唯一键写入或覆盖更新作品记录。
 6. 回填达人基础信息表中的基础字段和作品表关联字段。
+
+历史上用 Chrome/Crawlio 验证过 `/aweme/v1/web/aweme/post/` 响应捕获方法，这套方法保留在 `docs/data-source.md` 作为排障兜底，不再作为默认采集底层。
 
 ## 飞书 Base 信息
 
@@ -35,7 +37,7 @@ douyin_creator_monitor/local/feishu-ids.md
 
 ## 目录约定
 
-- `runtime/`: 浏览器抓取、飞书写入测试过程中产生的 JSON、JS、二维码、接口样本等运行产物。
+- `runtime/`: MediaCrawler 导出、浏览器抓取、飞书写入测试过程中产生的 JSON、JS、二维码、接口样本等运行产物。
 - `docs/`: 项目说明、字段说明、接口观察结论。
 - `scripts/`: 后续沉淀的可复用脚本。当前主要流程仍是手动验证和 CLI 命令组合。
 

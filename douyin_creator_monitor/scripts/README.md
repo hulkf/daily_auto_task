@@ -4,8 +4,7 @@
 
 当前项目还处在流程验证阶段，实际执行主要依赖：
 
-- Chrome 登录态
-- 页面接口观察
+- 本机 MediaCrawler 项目 checkout
 - `tools/lark-cli/lark-cli.exe`
 - `douyin_creator_monitor/runtime/` 中的 JSON 模板和测试产物
 
@@ -13,17 +12,35 @@
 
 - `sync_new_creator.ps1`: 读取达人基础信息表中的新增主页链接，抓取基础信息，新建作品表并写入首批作品。
 - `sync_creator_works.ps1`: 对已有达人检查新增作品并追加到对应作品表。
-- `extract_post_list.ps1`: 通过浏览器上下文读取抖音主页作品列表接口。
+- `extract_post_list.ps1`: 通过浏览器上下文读取抖音主页作品列表接口。该方式现在只作为 MediaCrawler 异常时的排障兜底。
 - `transcribe_with_tingwu.ps1`: 下载音频并对接通义听悟网页转写流程。
 
 已开始沉淀的脚本：
 
 - `download_douyin_media.py`: 使用已签名的抖音视频/音频 URL 下载样本，并用 FFmpeg 生成 16k 单声道 WAV。
+- `collect_douyin_creator_with_mediacrawler.py`: 调用外部 MediaCrawler 项目框架采集抖音达人作品，默认让 MediaCrawler 输出 JSONL，再规范化为本项目统一作品 JSON。输出默认写入 `douyin_creator_monitor/runtime/zhiliao-works-from-mediacrawler.json`。
 - `volcengine_asr.py`: 调用火山引擎 ASR 的本地入口，凭证从环境变量或本地忽略配置读取。
 - `bailian_paraformer.py`: 调用阿里云百炼/DashScope Paraformer 的本地入口，凭证从环境变量读取。
 - `transcribe_douyin_audio_url.py`: 正式转写入口，接收抖音音频 URL，默认使用火山引擎；百炼 Paraformer 仅作为低成本备选。
 - `feishu_transcript_writer.py`: 按 `抖音作品ID` 定位飞书作品表记录，并把词库纠正后的最终文案写回 `语音转写全文` 字段。
-- `sync_douyin_works_to_feishu.py`: 读取 Crawlio 从 `/aweme/v1/web/aweme/post/` 捕获并规范化后的作品 JSON，按 `抖音作品ID` 覆盖更新飞书作品表；只新增和更新，不删除飞书中已存在但本轮未抓到的历史记录。
+- `sync_douyin_works_to_feishu.py`: 读取 MediaCrawler 适配层规范化后的作品 JSON，按 `抖音作品ID` 覆盖更新飞书作品表；只新增和更新，不删除飞书中已存在但本轮未抓到的历史记录。仍可通过 `--works-file` 指定历史 Crawlio 产物做兼容导入。
+
+MediaCrawler 采集示例：
+
+```powershell
+$env:MEDIACRAWLER_DIR = "D:\path\to\MediaCrawler"
+python douyin_creator_monitor\scripts\collect_douyin_creator_with_mediacrawler.py `
+  --creator-url "https://www.douyin.com/user/MS4wLjABAAAAoePkj5ldelmgGm4fSjvGmaayTHyvuwq6XIz_1Occ9uc" `
+  --expect-min-count 43 `
+  --clean-media-output
+```
+
+采集完成后写入飞书：
+
+```powershell
+$env:FEISHU_BASE_TOKEN = "..."
+python douyin_creator_monitor\scripts\sync_douyin_works_to_feishu.py --table-id tbl3V4TExJxJEjC3
+```
 
 火山引擎凭证不要写入仓库。建议在本机环境变量或 `douyin_creator_monitor/local/volcengine.env.json` 下维护：
 

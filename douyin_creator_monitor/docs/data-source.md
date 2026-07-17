@@ -1,6 +1,75 @@
 # Data Source Notes
 
-## 抖音主页作品列表接口
+## 当前默认：MediaCrawler 采集框架
+
+从现在开始，本项目抓取抖音达人作品的默认底层使用外部 MediaCrawler 项目框架，不再把本项目自己的浏览器/Crawlio 捕获逻辑作为主路径。
+
+本项目只保留一个薄适配层：
+
+```text
+douyin_creator_monitor/scripts/collect_douyin_creator_with_mediacrawler.py
+```
+
+职责边界：
+
+1. 调用本机 MediaCrawler checkout，对抖音达人主页执行 `dy + creator` 类型采集。
+2. 读取 MediaCrawler 导出的 JSONL/JSON/CSV 结果。
+3. 规范化为本项目后续飞书同步脚本所需的统一结构。
+4. 在写出结果前校验每条当前作品必须具备：`aweme_id`、`create_time`、`digg_count`、`comment_count`、`collect_count`、`share_count`。
+
+默认输出：
+
+```text
+douyin_creator_monitor/runtime/zhiliao-works-from-mediacrawler.json
+```
+
+示例命令：
+
+```powershell
+$env:MEDIACRAWLER_DIR = "D:\path\to\MediaCrawler"
+python douyin_creator_monitor\scripts\collect_douyin_creator_with_mediacrawler.py `
+  --creator-url "https://www.douyin.com/user/MS4wLjABAAAAoePkj5ldelmgGm4fSjvGmaayTHyvuwq6XIz_1Occ9uc" `
+  --expect-min-count 43 `
+  --clean-media-output
+```
+
+如果 MediaCrawler 已经生成过导出文件，也可以只做规范化：
+
+```powershell
+python douyin_creator_monitor\scripts\collect_douyin_creator_with_mediacrawler.py `
+  --creator-url "https://www.douyin.com/user/MS4wLjABAAAAoePkj5ldelmgGm4fSjvGmaayTHyvuwq6XIz_1Occ9uc" `
+  --media-crawler-dir "D:\path\to\MediaCrawler" `
+  --normalize-only
+```
+
+MediaCrawler checkout、登录态、Cookie、原始导出和本项目运行产物都属于本机状态，不提交到 Git。
+
+## 统一作品字段映射
+
+本项目下游统一使用以下字段，不关心底层是 MediaCrawler 原始字段还是抖音接口原始字段：
+
+```text
+aweme_id -> 抖音作品ID
+desc -> 原始文案 / 作品标题 / 话题标签
+create_time -> 发布时间（Unix 秒，写入前转北京时间）
+digg_count -> 点赞数
+comment_count -> 评论数
+collect_count -> 收藏数
+share_count -> 分享数
+cover_url -> 封面图URL
+url -> 作品链接
+is_top -> 是否置顶
+```
+
+适配层默认要求 MediaCrawler 以 `jsonl` 保存，兼容 `json` 和 `csv`。调用时会显式传入 MediaCrawler 官方 CLI 参数：`--platform dy`、`--type creator`、`--creator_id`、`--crawler_max_notes_count`、`--save_data_option`、`--save_data_path`。
+
+适配层会兼容 MediaCrawler 常见等价字段，例如 `liked_count`、`collected_count`、`aweme_url`，也兼容抖音原始接口里的 `statistics.digg_count/comment_count/collect_count/share_count`。
+
+正式写入飞书前必须先完成核心字段校验。缺少发布时间或互动数据时，不能把任务报告为完成，也不能用空值覆盖飞书历史数据。
+
+## 历史兜底：抖音主页作品列表接口
+
+以下内容是此前为排查和验证数据源记录的浏览器/Crawlio 方法。它证明核心数据来自达人主页作品列表接口，但不再作为默认采集底层。
 
 当前验证可用的数据来源是达人主页加载时请求的列表接口：
 
