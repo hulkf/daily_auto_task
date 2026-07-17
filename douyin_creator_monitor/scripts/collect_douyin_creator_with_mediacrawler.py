@@ -68,6 +68,18 @@ def resolve_media_crawler_dir(value: str | None) -> Path:
     return media_dir.resolve()
 
 
+def resolve_media_crawler_python(media_dir: Path, value: str | None) -> str:
+    if value:
+        return str(Path(value).expanduser())
+    env_value = os.environ.get("MEDIACRAWLER_PYTHON")
+    if env_value:
+        return str(Path(env_value).expanduser())
+    local_venv_python = media_dir / ".venv" / "Scripts" / "python.exe"
+    if local_venv_python.exists():
+        return str(local_venv_python)
+    return sys.executable
+
+
 def as_int(value: Any) -> int | None:
     if value is None or value == "":
         return None
@@ -364,7 +376,7 @@ def run_mediacrawler(args: argparse.Namespace) -> None:
         ),
         encoding="utf-8",
     )
-    command = [sys.executable, str(bootstrap)]
+    command = [resolve_media_crawler_python(media_dir, args.media_crawler_python), str(bootstrap)]
     result = subprocess.run(command, cwd=media_dir, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise SystemExit(result.returncode)
@@ -397,6 +409,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Collect Douyin creator works through MediaCrawler and normalize them.")
     parser.add_argument("--creator-url", required=True, help="Douyin creator profile URL or sec_user_id.")
     parser.add_argument("--media-crawler-dir", help="Local MediaCrawler project checkout. Can also use MEDIACRAWLER_DIR.")
+    parser.add_argument("--media-crawler-python", help="Python executable with MediaCrawler dependencies. Defaults to MEDIACRAWLER_PYTHON or MediaCrawler/.venv.")
     parser.add_argument("--media-output-dir", default=str(DEFAULT_MEDIA_OUTPUT_DIR))
     parser.add_argument("--output-file", default=str(DEFAULT_OUTPUT_FILE))
     parser.add_argument("--max-count", type=int, default=200)

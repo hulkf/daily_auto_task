@@ -35,6 +35,8 @@ python douyin_creator_monitor\scripts\collect_douyin_creator_with_mediacrawler.p
   --clean-media-output
 ```
 
+如果 `D:\path\to\MediaCrawler\.venv\Scripts\python.exe` 存在，脚本会自动使用这个虚拟环境运行 MediaCrawler；也可以用 `MEDIACRAWLER_PYTHON` 或 `--media-crawler-python` 手动指定。
+
 采集完成后写入飞书：
 
 ```powershell
