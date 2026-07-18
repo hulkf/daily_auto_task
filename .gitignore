@@ -27,6 +27,8 @@ cache/
 
 # Locally installed third-party tools
 tools/lark-cli/
+tools/baidupcs-go/
+tools/kuake-cli/
 
 # Douyin creator monitor local/private Feishu config
 douyin_creator_monitor/local/

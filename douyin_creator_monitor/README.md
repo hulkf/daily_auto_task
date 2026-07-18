@@ -46,3 +46,7 @@ douyin_creator_monitor/local/feishu-ids.md
 ## IMA 文案备份
 
 火山 ASR 得到的 `.txt` 文案可以先保存到本地，再用 `scripts/backup_transcripts_to_ima.py` 备份到腾讯 IMA。博主和 IMA 知识库/文件夹的映射关系放在 `douyin_creator_monitor/local/ima_creator_mapping.json`，模板见 `config/ima_creator_mapping.example.json`。具体步骤见 `docs/ima-backup.md`。
+
+## 夸克网盘文案备份
+
+夸克网盘 CLI 已按本项目约定安装到本地 `tools/kuake-cli/`，真实登录态放在 `douyin_creator_monitor/local/kuake.env.json`。火山 ASR 得到的 `.txt` 文案可用 `scripts/backup_transcripts_to_kuake.py` 上传到指定夸克目录，默认按 `/视频文案备份/博主名/日期_视频ID_标题.txt` 组织。具体步骤见 `docs/kuake-backup.md`。

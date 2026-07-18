@@ -24,6 +24,7 @@
 - `transcribe_douyin_audio_url.py`: 正式转写入口，接收抖音音频 URL，默认使用火山引擎；百炼 Paraformer 仅作为低成本备选。
 - `feishu_transcript_writer.py`: 按 `抖音作品ID` 定位飞书作品表记录，并把词库纠正后的最终文案写回 `语音转写全文` 字段。
 - `sync_douyin_works_to_feishu.py`: 读取 MediaCrawler 适配层规范化后的作品 JSON，按 `抖音作品ID` 覆盖更新飞书作品表；只新增和更新，不删除飞书中已存在但本轮未抓到的历史记录。仍可通过 `--works-file` 指定历史 Crawlio 产物做兼容导入。
+- `backup_transcripts_to_kuake.py`: 读取本地夸克登录态配置，把火山 ASR 得到的 `.txt` 文案上传到夸克网盘指定目录。
 
 MediaCrawler 采集示例：
 
