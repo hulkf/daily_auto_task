@@ -49,6 +49,24 @@ class PipelineHelpersTest(unittest.TestCase):
         with self.assertRaises(PIPELINE.PipelineError):
             PIPELINE.asr_worker_count({}, args, 10)
 
+    def test_final_backup_status_maps_pipeline_outcomes(self):
+        self.assertEqual(PIPELINE.final_backup_status("success", "已上传"), "已上传")
+        self.assertEqual(PIPELINE.final_backup_status("skipped", "已写入"), "已写入")
+        self.assertEqual(PIPELINE.final_backup_status("disabled", "已上传"), "跳过")
+        self.assertEqual(PIPELINE.final_backup_status("blocked", "已上传"), "失败")
+        self.assertEqual(PIPELINE.final_backup_status("failed", "已写入"), "失败")
+
+    def test_status_writeback_command_contains_all_final_statuses(self):
+        config = {"python": "python", "feishu": {"work_id_field": "抖音作品ID", "as_identity": "user"}}
+        creator = {"key": "demo", "works_table_id": "tbl-demo"}
+        work = {"aweme_id": "123"}
+        stages = {"ima_backed_up": "success", "kuake_backed_up": "disabled", "obsidian_exported": "failed"}
+        command = PIPELINE.status_writeback_command(config, creator, work, stages)
+        self.assertIn("feishu_work_status_writer.py", command[1])
+        self.assertEqual(command[command.index("--ima-status") + 1], "已上传")
+        self.assertEqual(command[command.index("--kuake-status") + 1], "跳过")
+        self.assertEqual(command[command.index("--local-status") + 1], "失败")
+
 
 if __name__ == "__main__":
     unittest.main()

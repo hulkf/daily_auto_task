@@ -87,6 +87,7 @@ def build_patch(work: dict[str, Any], captured_at: str) -> dict[str, Any]:
         "收藏数": work.get("collect_count"),
         "分享数": work.get("share_count"),
         "最近采集时间": captured_at,
+        "记录时间": captured_at,
         "采集状态": "已完成",
         "原始作品数据": json.dumps(work, ensure_ascii=False, separators=(",", ":")),
     }

@@ -34,7 +34,7 @@ INVALID_PATH_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 STAGES = (
     "collected", "feishu_synced", "transcribed", "corrected",
     "feishu_written_back", "ima_backed_up", "kuake_backed_up",
-    "obsidian_exported",
+    "obsidian_exported", "backup_statuses_written_back",
 )
 
 
@@ -418,6 +418,34 @@ def writeback_command(config: dict[str, Any], creator: dict[str, Any], work: dic
     return command
 
 
+def final_backup_status(outcome: str, success_value: str) -> str:
+    if outcome in {"success", "skipped"}:
+        return success_value
+    if outcome == "disabled":
+        return "跳过"
+    return "失败"
+
+
+def status_writeback_command(
+    config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any], stages: dict[str, Any],
+) -> list[str]:
+    table = str(creator.get("works_table_id") or "").strip()
+    if not table:
+        raise PipelineError(f"达人 {creator_key(creator)} 缺少 works_table_id。")
+    feishu = section(config, "feishu")
+    command = py(
+        config, "feishu_work_status_writer.py", "--table-id", table,
+        "--work-id", work["aweme_id"],
+        "--ima-status", final_backup_status(str(stages.get("ima_backed_up", "blocked")), "已上传"),
+        "--kuake-status", final_backup_status(str(stages.get("kuake_backed_up", "blocked")), "已上传"),
+        "--local-status", final_backup_status(str(stages.get("obsidian_exported", "blocked")), "已写入"),
+    )
+    append_option(command, "--work-id-field", feishu.get("work_id_field"))
+    append_option(command, "--lark-cli", feishu.get("lark_cli"))
+    append_option(command, "--as", feishu.get("as_identity"))
+    return command
+
+
 def ima_command(config: dict[str, Any], creator: dict[str, Any], paths: dict[str, Path]) -> list[str]:
     ima = section(config, "ima")
     name = str(creator.get("ima_creator_name") or creator.get("creator_name") or creator.get("creator_dir_name") or "").strip()
@@ -713,6 +741,19 @@ def process_downstream(
             result["stages"][stage] = execute_stage(
                 stage, label, state, state_path, args, logger, action,
             )
+    try:
+        runner.run(
+            f"回写备份状态 {work_id}",
+            status_writeback_command(config, creator, work, result["stages"]),
+            env,
+            sensitive=("--table-id", "--base-token"),
+        )
+        result["stages"]["backup_statuses_written_back"] = "planned" if args.dry_run else "success"
+    except Exception as exc:
+        result["stages"]["backup_statuses_written_back"] = "failed"
+        logger.write(f"回写备份状态失败 {work_id}: {exc}")
+        if args.fail_fast:
+            raise
     return result
 
 
