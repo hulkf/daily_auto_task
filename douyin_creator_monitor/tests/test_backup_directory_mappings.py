@@ -110,6 +110,18 @@ class FeishuMappingPatchTest(unittest.TestCase):
             )
         self.assertEqual(record_id, "rec_aligc")
 
+    def test_creator_search_fallback_paginates_beyond_200_rows(self):
+        responses = [
+            {"ok": True, "data": {"data": [], "record_id_list": []}},
+            {"ok": True, "data": {"data": [["别的达人"]], "record_id_list": ["rec_other"], "has_more": True}},
+            {"ok": True, "data": {"data": [["目标达人"]], "record_id_list": ["rec_target"], "has_more": False}},
+        ]
+        with patch.object(SYNC, "run_lark", side_effect=responses) as mocked:
+            record_id = SYNC.search_creator_record("cli", "token", "table", "达人昵称", "目标达人", "user")
+        self.assertEqual(record_id, "rec_target")
+        args = mocked.call_args_list[2].args[1]
+        self.assertEqual(args[args.index("--offset") + 1], "200")
+
     def test_record_get_matrix_is_converted_to_field_mapping(self):
         payload = {
             "ok": True,
@@ -156,6 +168,18 @@ class FeishuMappingPatchTest(unittest.TestCase):
             {"IMA文件夹ID": "folder_123"},
         )
 
+    def test_multiple_provider_metadata_files_merge_into_one_patch(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            ima = root / "ima.json"
+            kuake = root / "kuake.json"
+            ima.write_text(json.dumps({"platform": "ima", "feishu_fields": {"IMA文件夹ID": "ima-1"}}), encoding="utf-8")
+            kuake.write_text(json.dumps({"platform": "kuake", "feishu_fields": {"夸克文件夹ID": "quark-1"}}), encoding="utf-8")
+            platforms, created, fields = SYNC.load_patches([ima, kuake])
+        self.assertEqual(platforms, ["ima", "kuake"])
+        self.assertFalse(created)
+        self.assertEqual(fields, {"IMA文件夹ID": "ima-1", "夸克文件夹ID": "quark-1"})
+
 
 class FeishuTranscriptWriterFallbackTest(unittest.TestCase):
     def test_work_id_search_falls_back_to_exact_field_list_match(self):
@@ -174,6 +198,18 @@ class FeishuTranscriptWriterFallbackTest(unittest.TestCase):
                 "lark-cli", "token", "table", "7662026755036761395", "抖音作品ID", "user"
             )
         self.assertEqual(record_id, "rec_work")
+
+    def test_work_search_fallback_paginates_beyond_200_rows(self):
+        responses = [
+            {"ok": True, "data": {"data": [], "record_id_list": []}},
+            {"ok": True, "data": {"data": [["111"]], "record_id_list": ["rec_other"], "has_more": True}},
+            {"ok": True, "data": {"data": [["999"]], "record_id_list": ["rec_work"], "has_more": False}},
+        ]
+        with patch.object(WRITER, "run_lark", side_effect=responses) as mocked:
+            record_id = WRITER.find_record_by_work_id("cli", "token", "table", "999", "抖音作品ID", "user")
+        self.assertEqual(record_id, "rec_work")
+        args = mocked.call_args_list[2].args[1]
+        self.assertEqual(args[args.index("--offset") + 1], "200")
 
 
 class ObsidianDirectoryMappingTest(unittest.TestCase):

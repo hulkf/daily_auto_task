@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 from feishu_transcript_writer import (
@@ -28,6 +29,12 @@ def build_patch(args: argparse.Namespace) -> dict[str, Any]:
         patch["夸克网盘状态"] = args.kuake_status
     if args.local_status:
         patch["本地知识库状态"] = args.local_status
+    transcript_file = getattr(args, "transcript_file", None)
+    if transcript_file:
+        transcript = Path(transcript_file).read_text(encoding="utf-8-sig").strip()
+        if not transcript:
+            raise SystemExit(f"Transcript file is empty: {transcript_file}")
+        patch[getattr(args, "transcript_field", "语音转写全文")] = transcript
     return patch
 
 
@@ -44,6 +51,8 @@ def main() -> int:
     parser.add_argument("--kuake-status", choices=["待上传", "已上传", "失败", "跳过"])
     parser.add_argument("--local-status", choices=["待写入", "已写入", "失败", "跳过"])
     parser.add_argument("--record-time")
+    parser.add_argument("--transcript-file")
+    parser.add_argument("--transcript-field", default="语音转写全文")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
 

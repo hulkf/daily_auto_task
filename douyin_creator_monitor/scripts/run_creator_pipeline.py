@@ -11,12 +11,14 @@ those modules and records resumable runtime state.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -63,6 +65,8 @@ class Runner:
     def __init__(self, logger: Logger, dry_run: bool) -> None:
         self.logger = logger
         self.dry_run = dry_run
+        self.metrics: list[dict[str, Any]] = []
+        self._metrics_lock = threading.Lock()
 
     @staticmethod
     def display(command: list[str], sensitive: Iterable[str]) -> str:
@@ -89,24 +93,37 @@ class Runner:
         shown = self.display(command, sensitive)
         if self.dry_run:
             self.logger.write(f"[DRY-RUN] {label}: {shown}")
+            with self._metrics_lock:
+                self.metrics.append({"label": label, "seconds": 0.0, "status": "planned"})
             return ""
         self.logger.write(f"开始 {label}: {shown}")
-        result = subprocess.run(
-            command,
-            cwd=PROJECT_DIR,
-            env=env,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            check=False,
-        )
+        started = time.perf_counter()
+        try:
+            result = subprocess.run(
+                command,
+                cwd=PROJECT_DIR,
+                env=env,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+        except Exception:
+            elapsed = round(time.perf_counter() - started, 3)
+            with self._metrics_lock:
+                self.metrics.append({"label": label, "seconds": elapsed, "status": "failed"})
+            raise
         stdout = result.stdout.strip()
         stderr = result.stderr.strip()
         if stdout:
             self.logger.write(f"{label} stdout: {truncate(stdout)}")
         if stderr:
             self.logger.write(f"{label} stderr: {truncate(stderr)}")
+        elapsed = round(time.perf_counter() - started, 3)
+        status = "failed" if result.returncode else "success"
+        with self._metrics_lock:
+            self.metrics.append({"label": label, "seconds": elapsed, "status": status})
         if result.returncode:
             raise PipelineError(f"{label} 失败，退出码 {result.returncode}: {stderr or stdout}")
         self.logger.write(f"完成 {label}")
@@ -261,14 +278,34 @@ def status_of(state: dict[str, Any], stage: str) -> str:
     return str(value.get("status") or "") if isinstance(value, dict) else ""
 
 
-def set_status(state: dict[str, Any], stage: str, status: str, detail: str = "", inferred: bool = False) -> None:
+def set_status(
+    state: dict[str, Any], stage: str, status: str, detail: str = "", inferred: bool = False,
+    duration_seconds: float | None = None,
+) -> None:
     item: dict[str, Any] = {"status": status, "updated_at": now_text()}
     if detail:
         item["detail"] = detail
     if inferred:
         item["inferred"] = True
+    if duration_seconds is not None:
+        item["duration_seconds"] = round(duration_seconds, 3)
     state.setdefault("stages", {})[stage] = item
     state["updated_at"] = now_text()
+
+
+def set_combined_finalizer_status(
+    state: dict[str, Any], *, transcript_included: bool, status: str,
+    duration_seconds: float, detail: str = "",
+) -> None:
+    """Record one remote operation once while keeping both logical stages resumable."""
+    operation_id = f"finalizer-{time.time_ns()}"
+    if transcript_included:
+        set_status(state, "feishu_written_back", status, detail, duration_seconds=duration_seconds)
+        set_status(state, "backup_statuses_written_back", status, detail, duration_seconds=0.0)
+    else:
+        set_status(state, "backup_statuses_written_back", status, detail, duration_seconds=duration_seconds)
+    for stage in (("feishu_written_back", "backup_statuses_written_back") if transcript_included else ("backup_statuses_written_back",)):
+        state["stages"][stage]["operation_id"] = operation_id
 
 
 def should_skip(
@@ -297,19 +334,20 @@ def execute_stage(
     if should_skip(state, stage, args.resume, args.force_stage, files):
         logger.write(f"跳过 {label}：状态已完成")
         return "skipped"
+    started = time.perf_counter()
     try:
         action()
         if not args.dry_run:
             missing = [str(path) for path in files if not nonempty(path)]
             if missing:
                 raise PipelineError(f"{label} 未生成预期文件: {missing}")
-            set_status(state, stage, "success")
+            set_status(state, stage, "success", duration_seconds=time.perf_counter() - started)
             write_json(state_path, state)
         return "planned" if args.dry_run else "success"
     except Exception as exc:  # Keep other backups and works running.
         logger.write(f"失败 {label}: {exc}")
         if not args.dry_run:
-            set_status(state, stage, "failed", str(exc))
+            set_status(state, stage, "failed", str(exc), duration_seconds=time.perf_counter() - started)
             write_json(state_path, state)
         return "failed"
 
@@ -402,7 +440,10 @@ def correction_command(config: dict[str, Any], creator: dict[str, Any], paths: d
     return command
 
 
-def writeback_command(config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any], paths: dict[str, Path]) -> list[str]:
+def writeback_command(
+    config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any], paths: dict[str, Path],
+    record_id: str | None = None,
+) -> list[str]:
     table = str(creator.get("works_table_id") or "").strip()
     if not table:
         raise PipelineError(f"达人 {creator_key(creator)} 缺少 works_table_id。")
@@ -415,6 +456,7 @@ def writeback_command(config: dict[str, Any], creator: dict[str, Any], work: dic
     append_option(command, "--transcript-field", feishu.get("transcript_field"))
     append_option(command, "--lark-cli", feishu.get("lark_cli"))
     append_option(command, "--as", feishu.get("as_identity"))
+    append_option(command, "--record-id", record_id)
     return command
 
 
@@ -426,8 +468,20 @@ def final_backup_status(outcome: str, success_value: str) -> str:
     return "失败"
 
 
+def finalizer_needed(
+    stages: dict[str, Any], transcript_file: Path | None, prior_status: str, resume: bool,
+) -> bool:
+    if transcript_file is not None or not resume or prior_status != "success":
+        return True
+    return any(
+        stages.get(stage) not in {"skipped", "disabled"}
+        for stage in ("ima_backed_up", "kuake_backed_up", "obsidian_exported")
+    )
+
+
 def status_writeback_command(
     config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any], stages: dict[str, Any],
+    record_id: str | None = None, transcript_file: Path | None = None,
 ) -> list[str]:
     table = str(creator.get("works_table_id") or "").strip()
     if not table:
@@ -443,7 +497,27 @@ def status_writeback_command(
     append_option(command, "--work-id-field", feishu.get("work_id_field"))
     append_option(command, "--lark-cli", feishu.get("lark_cli"))
     append_option(command, "--as", feishu.get("as_identity"))
+    append_option(command, "--record-id", record_id)
+    append_option(command, "--transcript-file", transcript_file)
+    append_option(command, "--transcript-field", feishu.get("transcript_field"))
     return command
+
+
+def parse_sync_record_ids(output: str) -> dict[str, str]:
+    if not output.strip():
+        return {}
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return {}
+    values = payload.get("record_ids") if isinstance(payload, dict) else None
+    if not isinstance(values, dict):
+        return {}
+    return {
+        str(work_id): str(record_id)
+        for work_id, record_id in values.items()
+        if str(work_id).strip() and str(record_id).startswith("rec")
+    }
 
 
 def ima_command(config: dict[str, Any], creator: dict[str, Any], paths: dict[str, Path]) -> list[str]:
@@ -549,7 +623,9 @@ def creator_match(creator: dict[str, Any]) -> tuple[str, str]:
     raise PipelineError("无法确定飞书达人基础表的匹配字段和值。")
 
 
-def mapping_sync_command(config: dict[str, Any], creator: dict[str, Any], metadata: Path) -> list[str]:
+def mapping_sync_command(
+    config: dict[str, Any], creator: dict[str, Any], metadata: Path | list[Path],
+) -> list[str]:
     feishu = section(config, "feishu")
     table_id = str(feishu.get("creator_table_id") or "").strip()
     if not table_id or table_id == "REPLACE_WITH_FEISHU_CREATOR_TABLE_ID":
@@ -557,9 +633,11 @@ def mapping_sync_command(config: dict[str, Any], creator: dict[str, Any], metada
     match_field, match_value = creator_match(creator)
     command = py(
         config, "sync_creator_backup_mapping_to_feishu.py",
-        "--table-id", table_id, "--metadata-file", metadata,
-        "--match-field", match_field, "--match-value", match_value,
+        "--table-id", table_id, "--match-field", match_field, "--match-value", match_value,
     )
+    metadata_files = metadata if isinstance(metadata, list) else [metadata]
+    for metadata_file in metadata_files:
+        command.extend(["--metadata-file", str(metadata_file)])
     append_option(command, "--lark-cli", feishu.get("lark_cli"))
     append_option(command, "--as", feishu.get("as_identity"))
     return command
@@ -603,22 +681,189 @@ def sync_creator_backup_mappings(
             mapping_dir / "obsidian.json",
         ),
     ]
-    outcomes: dict[str, str] = {}
-    for label, disabled, ensure_command, metadata in tasks:
+    enabled_metadata = [metadata for _, disabled, _, metadata in tasks if not disabled]
+    marker_path = mapping_dir / "feishu-sync.json"
+    expected_names = {
+        "ima": str(creator.get("ima_creator_name") or creator.get("creator_name") or creator.get("creator_dir_name") or "").strip(),
+        "kuake": str(creator.get("creator_dir_name") or creator.get("creator_name") or "").strip(),
+        "obsidian": str(creator.get("creator_dir_name") or creator.get("creator_name") or "").strip(),
+    }
+    cache_ttl = float(section(config, "backups").get("mapping_cache_ttl_hours", 24))
+    if not args.refresh_mappings and mapping_cache_is_fresh(
+        enabled_metadata, cache_ttl, marker_path=marker_path,
+        expected_creator_name=expected_names, expected_creator_key=creator_key(creator),
+    ):
+        logger.write(f"复用达人目录映射缓存，有效期 {cache_ttl:g} 小时")
+        return {
+            label.casefold(): ("disabled" if disabled else "cached")
+            for label, disabled, _, _ in tasks
+        }
+    outcomes: dict[str, str] = {
+        label.casefold(): "disabled" for label, disabled, _, _ in tasks if disabled
+    }
+    enabled_tasks = [item for item in tasks if not item[1]]
+    ensure_actions = [
+        (
+            label.casefold(),
+            lambda label=label, command=ensure_command: runner.run(
+                f"确认{label}达人目录", command, env,
+            ),
+        )
+        for label, _, ensure_command, _ in enabled_tasks
+    ]
+    ensure_results = run_independent_actions(
+        ensure_actions, backup_worker_count(config, args, len(ensure_actions)), args.dry_run,
+    )
+    ready_metadata: list[Path] = []
+    for label, _, _, metadata in enabled_tasks:
         key = label.casefold()
-        if disabled:
-            outcomes[key] = "disabled"
-            continue
-        try:
-            outcomes[key] = ensure_and_sync_mapping(
-                runner, label, ensure_command,
-                mapping_sync_command(config, creator, metadata), env,
-            )
-        except Exception as exc:
+        item = ensure_results.get(key, {"status": "failed", "error": "missing result"})
+        if item.get("status") == "failed":
             outcomes[key] = "failed"
-            logger.write(f"{label} 达人目录映射同步失败: {exc}")
+            logger.write(f"{label} 达人目录确认失败: {item.get('error', '')}")
+        else:
+            outcomes[key] = str(item.get("status") or "success")
+            ready_metadata.append(metadata)
+    if ready_metadata:
+        try:
+            output = runner.run(
+                "合并回写达人目录映射到飞书",
+                mapping_sync_command(config, creator, ready_metadata), env,
+                sensitive=("--table-id", "--base-token", "--match-value"),
+            )
+            sync_status = "planned" if args.dry_run else "success"
+            if output:
+                try:
+                    sync_status = str(json.loads(output).get("status") or sync_status)
+                except json.JSONDecodeError:
+                    pass
+            for label, _, _, metadata in enabled_tasks:
+                key = label.casefold()
+                if metadata in ready_metadata:
+                    outcomes[key] = sync_status
+            if not args.dry_run and sync_status in {"success", "updated", "skipped"}:
+                write_json(marker_path, {
+                    "creator_key": creator_key(creator),
+                    "signature": mapping_cache_signature(ready_metadata),
+                    "synced_at": now_text(),
+                })
+        except Exception as exc:
+            logger.write(f"达人目录映射合并回写失败: {exc}")
+            for label, _, _, metadata in enabled_tasks:
+                if metadata in ready_metadata:
+                    outcomes[label.casefold()] = "failed"
             if args.fail_fast:
                 raise
+    return outcomes
+
+
+def mapping_cache_signature(paths: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(paths, key=lambda item: str(item).casefold()):
+        digest.update(path.stem.casefold().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def mapping_cache_is_fresh(
+    paths: list[Path], ttl_hours: float, now_epoch: float | None = None, *,
+    marker_path: Path | None = None,
+    expected_creator_name: str | dict[str, str] | None = None,
+    expected_creator_key: str | None = None,
+) -> bool:
+    if not paths or ttl_hours <= 0:
+        return False
+    now_value = time.time() if now_epoch is None else now_epoch
+    maximum_age = ttl_hours * 3600
+    for path in paths:
+        if not path.is_file() or path.stat().st_size <= 2:
+            return False
+        if now_value - path.stat().st_mtime > maximum_age:
+            return False
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        expected_platform = path.stem.casefold()
+        directory = payload.get("directory") if isinstance(payload, dict) else None
+        fields = payload.get("feishu_fields") if isinstance(payload, dict) else None
+        expected_name = (
+            expected_creator_name.get(expected_platform, "")
+            if isinstance(expected_creator_name, dict)
+            else expected_creator_name
+        )
+        if (
+            not isinstance(payload, dict)
+            or str(payload.get("platform") or "").casefold() != expected_platform
+            or not isinstance(directory, dict)
+            or not str(directory.get("path") or "").strip()
+            or (expected_name is not None and str(directory.get("name") or "").strip() != str(expected_name).strip())
+            or not isinstance(fields, dict)
+            or not fields
+        ):
+            return False
+    if marker_path is None or not marker_path.is_file():
+        return False
+    try:
+        marker = json.loads(marker_path.read_text(encoding="utf-8-sig"))
+        if expected_creator_key is not None and marker.get("creator_key") != expected_creator_key:
+            return False
+        if marker.get("signature") != mapping_cache_signature(paths):
+            return False
+    except (OSError, json.JSONDecodeError):
+        return False
+    return True
+
+
+def summarize_metrics(metrics: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "total_calls": len(metrics),
+        "total_seconds": round(sum(float(item.get("seconds") or 0) for item in metrics), 3),
+        "failed_calls": sum(1 for item in metrics if item.get("status") == "failed"),
+        "calls": list(metrics),
+    }
+
+
+def backup_worker_count(config: dict[str, Any], args: argparse.Namespace, action_count: int) -> int:
+    configured = args.backup_workers
+    if configured is None:
+        configured = section(config, "backups").get("max_workers", 3)
+    try:
+        workers = int(configured)
+    except (TypeError, ValueError) as exc:
+        raise PipelineError(f"backups.max_workers 必须是整数: {configured}") from exc
+    if workers < 1:
+        raise PipelineError("备份并发数必须至少为 1。")
+    return min(workers, max(1, action_count))
+
+
+def run_independent_actions(
+    actions: list[tuple[str, Callable[[], None]]], max_workers: int, dry_run: bool,
+) -> dict[str, dict[str, Any]]:
+    def invoke(action: Callable[[], None]) -> dict[str, Any]:
+        started = time.perf_counter()
+        try:
+            action()
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "error": str(exc),
+                "duration_seconds": round(time.perf_counter() - started, 3),
+            }
+        return {
+            "status": "planned" if dry_run else "success",
+            "duration_seconds": round(time.perf_counter() - started, 3),
+        }
+
+    if not actions:
+        return {}
+    outcomes: dict[str, dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(actions)), thread_name_prefix="backup") as executor:
+        futures = {executor.submit(invoke, action): stage for stage, action in actions}
+        for future in as_completed(futures):
+            outcomes[futures[future]] = future.result()
     return outcomes
 
 
@@ -691,7 +936,7 @@ def process_downstream(
     config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any],
     works_file: Path, profile_file: Path | None, state_dir: Path, media_dir: Path,
     runner: Runner, logger: Logger, env: dict[str, str], args: argparse.Namespace,
-    result: dict[str, Any],
+    result: dict[str, Any], record_id: str | None = None,
 ) -> dict[str, Any]:
     work_id = str(work["aweme_id"])
     state_path = state_dir / creator_key(creator) / f"{safe_key(work_id)}.json"
@@ -702,14 +947,19 @@ def process_downstream(
     final_available = (args.dry_run or nonempty(paths["final"])) and correction_outcome not in {"failed", "blocked"}
     if correction_outcome == "disabled":
         final_available = nonempty(paths["final"])
-    downstream: list[tuple[str, bool, str, Callable[[], None]]] = [
-        (
-            "feishu_written_back", args.skip_feishu_writeback, f"回写飞书 {work_id}",
-            lambda: runner.run(
-                f"回写飞书 {work_id}", writeback_command(config, creator, work, paths), env,
-                sensitive=("--table-id", "--base-token"),
-            ),
-        ),
+    transcript_file: Path | None = None
+    if args.skip_feishu_writeback:
+        result["stages"]["feishu_written_back"] = "disabled"
+    elif not final_available:
+        result["stages"]["feishu_written_back"] = "blocked"
+    elif should_skip(state, "feishu_written_back", args.resume, args.force_stage):
+        logger.write(f"跳过 回写飞书 {work_id}：状态已完成")
+        result["stages"]["feishu_written_back"] = "skipped"
+    else:
+        result["stages"]["feishu_written_back"] = "pending"
+        transcript_file = paths["final"]
+
+    backups: list[tuple[str, bool, str, Callable[[], None]]] = [
         (
             "ima_backed_up",
             args.skip_ima or not bool(section(config, "ima").get("enabled", True)),
@@ -732,26 +982,76 @@ def process_downstream(
             ),
         ),
     ]
-    for stage, disabled, label, action in downstream:
+    runnable: list[tuple[str, Callable[[], None]]] = []
+    for stage, disabled, label, action in backups:
         if disabled:
             result["stages"][stage] = "disabled"
         elif not final_available:
             result["stages"][stage] = "blocked"
+        elif should_skip(state, stage, args.resume, args.force_stage):
+            logger.write(f"跳过 {label}：状态已完成")
+            result["stages"][stage] = "skipped"
         else:
-            result["stages"][stage] = execute_stage(
-                stage, label, state, state_path, args, logger, action,
+            runnable.append((stage, action))
+
+    outcomes = run_independent_actions(
+        runnable, backup_worker_count(config, args, len(runnable)), args.dry_run,
+    )
+    state_changed = False
+    for stage, outcome in outcomes.items():
+        status = str(outcome["status"])
+        result["stages"][stage] = status
+        if status == "failed":
+            logger.write(f"失败 {stage}: {outcome.get('error', '')}")
+        if not args.dry_run:
+            set_status(
+                state, stage, status, str(outcome.get("error") or ""),
+                duration_seconds=float(outcome.get("duration_seconds") or 0),
             )
+            state_changed = True
+    if state_changed:
+        write_json(state_path, state)
+    if args.fail_fast and any(item.get("status") == "failed" for item in outcomes.values()):
+        raise PipelineError(f"作品 {work_id} 存在备份失败阶段。")
+    if not finalizer_needed(
+        result["stages"], transcript_file,
+        status_of(state, "backup_statuses_written_back"), args.resume,
+    ):
+        result["stages"]["backup_statuses_written_back"] = "skipped"
+        return result
+
+    finalizer_started = time.perf_counter()
     try:
         runner.run(
-            f"回写备份状态 {work_id}",
-            status_writeback_command(config, creator, work, result["stages"]),
+            f"合并回写文案与备份状态 {work_id}",
+            status_writeback_command(
+                config, creator, work, result["stages"], record_id, transcript_file,
+            ),
             env,
             sensitive=("--table-id", "--base-token"),
         )
+        finalizer_seconds = time.perf_counter() - finalizer_started
+        if transcript_file is not None:
+            result["stages"]["feishu_written_back"] = "planned" if args.dry_run else "success"
         result["stages"]["backup_statuses_written_back"] = "planned" if args.dry_run else "success"
+        if not args.dry_run:
+            set_combined_finalizer_status(
+                state, transcript_included=transcript_file is not None,
+                status="success", duration_seconds=finalizer_seconds,
+            )
+            write_json(state_path, state)
     except Exception as exc:
+        if transcript_file is not None:
+            result["stages"]["feishu_written_back"] = "failed"
         result["stages"]["backup_statuses_written_back"] = "failed"
         logger.write(f"回写备份状态失败 {work_id}: {exc}")
+        if not args.dry_run:
+            finalizer_seconds = time.perf_counter() - finalizer_started
+            set_combined_finalizer_status(
+                state, transcript_included=transcript_file is not None,
+                status="failed", duration_seconds=finalizer_seconds, detail=str(exc),
+            )
+            write_json(state_path, state)
         if args.fail_fast:
             raise
     return result
@@ -769,7 +1069,7 @@ def process_work(
     )
     return process_downstream(
         config, creator, work, works_file, profile_file, state_dir, media_dir,
-        runner, logger, env, args, result,
+        runner, logger, env, args, result, None,
     )
 
 
@@ -846,14 +1146,16 @@ def process_creator(
             write_json(state_path, state)
 
     sync_ok = True
+    synced_record_ids: dict[str, str] = {}
     if args.skip_feishu_sync:
         logger.write(f"跳过飞书作品同步 {name}")
     else:
         try:
-            runner.run(
+            sync_output = runner.run(
                 f"飞书作品同步 {name}", sync_command(config, creator, works_file), env,
                 sensitive=("--table-id", "--base-token"),
             )
+            synced_record_ids = parse_sync_record_ids(sync_output)
         except Exception as exc:
             sync_ok = False
             result["feishu_sync_error"] = str(exc)
@@ -914,7 +1216,7 @@ def process_creator(
         work_id = str(work["aweme_id"])
         work_result = process_downstream(
             config, creator, work, works_file, profile_file, state_dir, media_dir,
-            runner, logger, env, args, prepared[work_id],
+            runner, logger, env, args, prepared[work_id], synced_record_ids.get(work_id),
         )
         result["works"].append(work_result)
         if args.fail_fast and "failed" in work_result["stages"].values():
@@ -937,6 +1239,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--asr-workers", type=int, default=None,
         help="视频转音频和 ASR 并发数；默认读取 asr.max_workers，未配置时为 4",
     )
+    parser.add_argument(
+        "--backup-workers", type=int, default=None,
+        help="IMA/夸克/Obsidian 独立备份并发数；默认读取 backups.max_workers，未配置时为 3",
+    )
     parser.add_argument("--skip-collect", action="store_true")
     parser.add_argument("--normalize-only", action="store_true", help="采集阶段只规范化已有 MediaCrawler 输出")
     parser.add_argument("--skip-feishu-sync", action="store_true")
@@ -946,6 +1252,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-ima", action="store_true")
     parser.add_argument("--skip-kuake", action="store_true")
     parser.add_argument("--skip-obsidian", action="store_true")
+    parser.add_argument(
+        "--refresh-mappings", action="store_true",
+        help="忽略达人目录映射缓存，重新确认 IMA/夸克/Obsidian 目录并回写飞书",
+    )
     parser.add_argument(
         "--force-stage", action="append", choices=["all", *STAGES], default=[],
         help="强制重跑指定阶段，可重复",
@@ -959,6 +1269,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    wall_started = time.perf_counter()
+    started_at = now_text()
+    run_id = datetime.now(BEIJING_TZ).strftime("%Y%m%d-%H%M%S")
+    config: dict[str, Any] | None = None
+    runner: Runner | None = None
     args = build_parser().parse_args(argv)
     try:
         config_path = path_from(args.config)
@@ -978,14 +1293,13 @@ def main(argv: list[str] | None = None) -> int:
         if not creators:
             raise PipelineError("没有需要运行的达人。")
 
-        run_id = datetime.now(BEIJING_TZ).strftime("%Y%m%d-%H%M%S")
         log_dir = path_from(config.get("log_dir"), DEFAULT_LOG_DIR) or DEFAULT_LOG_DIR
         logger = Logger(log_dir / f"pipeline-{run_id}.log", persist=not args.dry_run)
         runner = Runner(logger, args.dry_run)
         env = child_env(config)
         logger.write(f"流水线开始，配置={config_path}，dry_run={args.dry_run}")
         summary: dict[str, Any] = {
-            "run_id": run_id, "started_at": now_text(), "config": str(config_path),
+            "run_id": run_id, "started_at": started_at, "config": str(config_path),
             "dry_run": args.dry_run, "creators": [],
         }
 
@@ -1002,6 +1316,8 @@ def main(argv: list[str] | None = None) -> int:
                 summary["creators"].append(creator_result)
 
         summary["finished_at"] = now_text()
+        summary["wall_seconds"] = round(time.perf_counter() - wall_started, 3)
+        summary["timings"] = summarize_metrics(runner.metrics)
         failed = any(item.get("status") in {"failed", "partial_failure"} for item in summary["creators"])
         summary["status"] = "partial_failure" if failed else ("planned" if args.dry_run else "success")
         if not args.dry_run:
@@ -1011,7 +1327,22 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 1 if failed else 0
     except PipelineError as exc:
-        print(f"错误: {exc}", file=sys.stderr)
+        failure_summary = {
+            "run_id": run_id,
+            "started_at": started_at,
+            "finished_at": now_text(),
+            "status": "failed",
+            "error": str(exc),
+            "wall_seconds": round(time.perf_counter() - wall_started, 3),
+            "timings": summarize_metrics(runner.metrics if runner is not None else []),
+        }
+        if config is not None and not args.dry_run:
+            try:
+                state_dir = path_from(config.get("state_dir"), DEFAULT_STATE_DIR) or DEFAULT_STATE_DIR
+                write_json(state_dir / "runs" / f"{run_id}.json", failure_summary)
+            except (OSError, PipelineError):
+                pass
+        print(json.dumps(failure_summary, ensure_ascii=False), file=sys.stderr)
         return 2
 
 

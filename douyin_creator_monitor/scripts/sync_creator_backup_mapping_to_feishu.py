@@ -105,22 +105,29 @@ def search_creator_record(
         # Some Base tables do not return row objects from keyword search even
         # for an exact text match. Use a field-scoped list as a deterministic
         # fallback and compare the returned cell value ourselves.
-        listed = run_lark(
-            cli,
-            [
-                "base", "+record-list", "--base-token", base_token,
-                "--table-id", table_id, "--field-id", match_field,
-                "--limit", "200", "--format", "json", "--as", as_identity,
-            ],
-        )
-        data = listed.get("data") if isinstance(listed.get("data"), dict) else {}
-        rows = data.get("data") if isinstance(data.get("data"), list) else []
-        record_ids = data.get("record_id_list") if isinstance(data.get("record_id_list"), list) else []
-        matches = [
-            record_id
-            for row, record_id in zip(rows, record_ids)
-            if isinstance(row, list) and row and str(row[0] or "").strip() == match_value
-        ]
+        matches: list[str] = []
+        offset = 0
+        while True:
+            listed = run_lark(
+                cli,
+                [
+                    "base", "+record-list", "--base-token", base_token,
+                    "--table-id", table_id, "--field-id", match_field,
+                    "--offset", str(offset), "--limit", "200",
+                    "--format", "json", "--as", as_identity,
+                ],
+            )
+            data = listed.get("data") if isinstance(listed.get("data"), dict) else {}
+            rows = data.get("data") if isinstance(data.get("data"), list) else []
+            record_ids = data.get("record_id_list") if isinstance(data.get("record_id_list"), list) else []
+            matches.extend(
+                record_id
+                for row, record_id in zip(rows, record_ids)
+                if isinstance(row, list) and row and str(row[0] or "").strip() == match_value
+            )
+            if not data.get("has_more"):
+                break
+            offset += 200
         unique = list(dict.fromkeys(matches))
         if not unique:
             raise MappingSyncError(f"达人基础信息表中未找到 {match_field}={match_value}。")
@@ -196,11 +203,28 @@ def load_patch(metadata_file: Path) -> tuple[str, bool, dict[str, Any]]:
     return str(data.get("platform") or "unknown"), bool(directory.get("created")), patch
 
 
+def load_patches(metadata_files: list[Path]) -> tuple[list[str], bool, dict[str, Any]]:
+    platforms: list[str] = []
+    created = False
+    merged: dict[str, Any] = {}
+    for metadata_file in metadata_files:
+        platform, item_created, patch = load_patch(metadata_file)
+        platforms.append(platform)
+        created = created or item_created
+        for field_name, value in patch.items():
+            if field_name in merged and comparable(merged[field_name]) != comparable(value):
+                raise MappingSyncError(f"多个映射文件对字段 {field_name} 提供了冲突值。")
+            merged[field_name] = value
+    if not merged:
+        raise MappingSyncError("没有可回写的备份目录映射字段。")
+    return platforms, created, merged
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="把达人备份目录映射回写到飞书达人基础信息表")
     parser.add_argument("--base-token")
     parser.add_argument("--table-id", required=True)
-    parser.add_argument("--metadata-file", type=Path, required=True)
+    parser.add_argument("--metadata-file", type=Path, action="append", required=True)
     parser.add_argument("--match-field", required=True)
     parser.add_argument("--match-value", required=True)
     parser.add_argument("--record-id")
@@ -209,7 +233,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     try:
-        platform, created, patch = load_patch(args.metadata_file)
+        platforms, created, patch = load_patches(args.metadata_file)
+        platform = ",".join(platforms)
         token = load_base_token(args.base_token)
         record_id = args.record_id or search_creator_record(
             args.lark_cli, token, args.table_id, args.match_field,

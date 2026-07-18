@@ -34,6 +34,10 @@
     "domain": "douyin_shop_ads",
     "glossary": "config/domain_glossary.json"
   },
+  "backups": {
+    "max_workers": 3,
+    "mapping_cache_ttl_hours": 24
+  },
   "ima": {
     "enabled": true,
     "mapping": "local/ima_creator_mapping.json",
