@@ -16,6 +16,8 @@ import os
 import re
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -44,15 +46,17 @@ class Logger:
     def __init__(self, path: Path, *, persist: bool = True) -> None:
         self.path = path
         self.persist = persist
+        self._lock = threading.Lock()
         if persist:
             path.parent.mkdir(parents=True, exist_ok=True)
 
     def write(self, message: str) -> None:
         line = f"[{datetime.now(BEIJING_TZ).strftime('%Y-%m-%d %H:%M:%S')}] {message}"
-        if self.persist:
-            with self.path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-        print(line)
+        with self._lock:
+            if self.persist:
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(line + "\n")
+            print(line)
 
 
 class Runner:
@@ -81,11 +85,11 @@ class Runner:
         env: dict[str, str],
         *,
         sensitive: Iterable[str] = (),
-    ) -> None:
+    ) -> str:
         shown = self.display(command, sensitive)
         if self.dry_run:
             self.logger.write(f"[DRY-RUN] {label}: {shown}")
-            return
+            return ""
         self.logger.write(f"开始 {label}: {shown}")
         result = subprocess.run(
             command,
@@ -106,6 +110,7 @@ class Runner:
         if result.returncode:
             raise PipelineError(f"{label} 失败，退出码 {result.returncode}: {stderr or stdout}")
         self.logger.write(f"完成 {label}")
+        return stdout
 
 
 def truncate(text: str, limit: int = 4000) -> str:
@@ -424,6 +429,17 @@ def ima_command(config: dict[str, Any], creator: dict[str, Any], paths: dict[str
     return command
 
 
+def ima_ensure_command(config: dict[str, Any], creator: dict[str, Any], metadata: Path) -> list[str]:
+    ima = section(config, "ima")
+    name = str(creator.get("ima_creator_name") or creator.get("creator_name") or creator.get("creator_dir_name") or "").strip()
+    if not name:
+        raise PipelineError("缺少 IMA 达人名称。")
+    command = py(config, "backup_transcripts_to_ima.py")
+    append_option(command, "--mapping", path_from(ima.get("mapping"), PROJECT_DIR / "local" / "ima_creator_mapping.json"))
+    command.extend(["ensure-folder", "--creator-name", name, "--metadata-output", str(metadata)])
+    return command
+
+
 def kuake_command(config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any], paths: dict[str, Path]) -> list[str]:
     kuake = section(config, "kuake")
     name = str(creator.get("creator_dir_name") or creator.get("creator_name") or "").strip()
@@ -438,6 +454,21 @@ def kuake_command(config: dict[str, Any], creator: dict[str, Any], work: dict[st
         "--video-date", date_of(work), "--video-id", str(work["aweme_id"]),
         "--title", title_of(work), "--create-dir",
     ])
+    append_option(command, "--base-dir", kuake.get("base_dir"))
+    append_option(command, "--remote-dir", creator.get("kuake_remote_dir"))
+    return command
+
+
+def kuake_ensure_command(config: dict[str, Any], creator: dict[str, Any], metadata: Path) -> list[str]:
+    kuake = section(config, "kuake")
+    name = str(creator.get("creator_dir_name") or creator.get("creator_name") or "").strip()
+    if not name:
+        raise PipelineError("缺少夸克达人目录名称。")
+    command = py(config, "backup_transcripts_to_kuake.py")
+    append_option(command, "--local-env", path_from(kuake.get("local_env"), PROJECT_DIR / "local" / "kuake.env.json"))
+    if kuake.get("kuake_exe"):
+        append_option(command, "--kuake-exe", path_from(kuake["kuake_exe"]))
+    command.extend(["ensure-creator-dir", "--creator-name", name, "--metadata-output", str(metadata)])
     append_option(command, "--base-dir", kuake.get("base_dir"))
     append_option(command, "--remote-dir", creator.get("kuake_remote_dir"))
     return command
@@ -462,7 +493,108 @@ def obsidian_command(
     return command
 
 
-def process_work(
+def obsidian_ensure_command(
+    config: dict[str, Any], creator: dict[str, Any], profile_file: Path | None, metadata: Path,
+) -> list[str]:
+    obsidian = section(config, "obsidian")
+    command = py(config, "export_transcript_to_obsidian.py", "--ensure-creator-dir-only", "--metadata-output", metadata)
+    append_option(command, "--profile-file", profile_file)
+    append_option(command, "--creator-name", creator.get("creator_name"))
+    append_option(command, "--creator-dir-name", creator.get("creator_dir_name"))
+    append_option(command, "--obsidian-original-dir", path_from(obsidian.get("original_dir")))
+    return command
+
+
+def creator_match(creator: dict[str, Any]) -> tuple[str, str]:
+    explicit_field = str(creator.get("feishu_match_field") or "").strip()
+    explicit_value = str(creator.get("feishu_match_value") or "").strip()
+    if explicit_field and explicit_value:
+        return explicit_field, explicit_value
+    creator_url = str(creator.get("creator_url") or "").strip().rstrip("/")
+    if creator_url:
+        sec_uid = creator_url.rsplit("/", 1)[-1].split("?", 1)[0].strip()
+        if sec_uid:
+            return "SecUID", sec_uid
+    name = str(creator.get("creator_name") or "").strip()
+    if name:
+        return "达人昵称", name
+    raise PipelineError("无法确定飞书达人基础表的匹配字段和值。")
+
+
+def mapping_sync_command(config: dict[str, Any], creator: dict[str, Any], metadata: Path) -> list[str]:
+    feishu = section(config, "feishu")
+    table_id = str(feishu.get("creator_table_id") or "").strip()
+    if not table_id or table_id == "REPLACE_WITH_FEISHU_CREATOR_TABLE_ID":
+        raise PipelineError("feishu.creator_table_id 未配置达人基础信息表 ID。")
+    match_field, match_value = creator_match(creator)
+    command = py(
+        config, "sync_creator_backup_mapping_to_feishu.py",
+        "--table-id", table_id, "--metadata-file", metadata,
+        "--match-field", match_field, "--match-value", match_value,
+    )
+    append_option(command, "--lark-cli", feishu.get("lark_cli"))
+    append_option(command, "--as", feishu.get("as_identity"))
+    return command
+
+
+def ensure_and_sync_mapping(
+    runner: Runner, label: str, ensure_command: list[str], sync_command: list[str], env: dict[str, str],
+) -> str:
+    runner.run(f"确认{label}达人目录", ensure_command, env)
+    output = runner.run(
+        f"回写{label}目录映射到飞书", sync_command, env,
+        sensitive=("--table-id", "--base-token", "--match-value"),
+    )
+    if runner.dry_run:
+        return "planned"
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return "success"
+    status = str(payload.get("status") or "success")
+    return status if status in {"skipped", "updated", "success"} else "success"
+
+
+def sync_creator_backup_mappings(
+    config: dict[str, Any], creator: dict[str, Any], profile_file: Path | None,
+    state_dir: Path, runner: Runner, logger: Logger, env: dict[str, str], args: argparse.Namespace,
+) -> dict[str, str]:
+    mapping_dir = state_dir / "mappings" / creator_key(creator)
+    tasks: list[tuple[str, bool, list[str], Path]] = [
+        (
+            "IMA", args.skip_ima or not bool(section(config, "ima").get("enabled", True)),
+            ima_ensure_command(config, creator, mapping_dir / "ima.json"), mapping_dir / "ima.json",
+        ),
+        (
+            "夸克", args.skip_kuake or not bool(section(config, "kuake").get("enabled", True)),
+            kuake_ensure_command(config, creator, mapping_dir / "kuake.json"), mapping_dir / "kuake.json",
+        ),
+        (
+            "Obsidian", args.skip_obsidian or not bool(section(config, "obsidian").get("enabled", True)),
+            obsidian_ensure_command(config, creator, profile_file, mapping_dir / "obsidian.json"),
+            mapping_dir / "obsidian.json",
+        ),
+    ]
+    outcomes: dict[str, str] = {}
+    for label, disabled, ensure_command, metadata in tasks:
+        key = label.casefold()
+        if disabled:
+            outcomes[key] = "disabled"
+            continue
+        try:
+            outcomes[key] = ensure_and_sync_mapping(
+                runner, label, ensure_command,
+                mapping_sync_command(config, creator, metadata), env,
+            )
+        except Exception as exc:
+            outcomes[key] = "failed"
+            logger.write(f"{label} 达人目录映射同步失败: {exc}")
+            if args.fail_fast:
+                raise
+    return outcomes
+
+
+def prepare_work(
     config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any],
     works_file: Path, profile_file: Path | None, state_dir: Path, media_dir: Path,
     runner: Runner, logger: Logger, env: dict[str, str], args: argparse.Namespace,
@@ -524,7 +656,21 @@ def process_work(
             (paths["final"], paths["report"]),
         )
 
-    correction_outcome = result["stages"]["corrected"]
+    return result
+
+
+def process_downstream(
+    config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any],
+    works_file: Path, profile_file: Path | None, state_dir: Path, media_dir: Path,
+    runner: Runner, logger: Logger, env: dict[str, str], args: argparse.Namespace,
+    result: dict[str, Any],
+) -> dict[str, Any]:
+    work_id = str(work["aweme_id"])
+    state_path = state_dir / creator_key(creator) / f"{safe_key(work_id)}.json"
+    state = load_state(state_path, creator, work)
+    provider = str(chosen(creator, section(config, "asr"), "provider", "volcengine"))
+    paths = artifact_paths(media_dir, work_id, provider)
+    correction_outcome = result["stages"].get("corrected", "blocked")
     final_available = (args.dry_run or nonempty(paths["final"])) and correction_outcome not in {"failed", "blocked"}
     if correction_outcome == "disabled":
         final_available = nonempty(paths["final"])
@@ -568,6 +714,35 @@ def process_work(
                 stage, label, state, state_path, args, logger, action,
             )
     return result
+
+
+def process_work(
+    config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any],
+    works_file: Path, profile_file: Path | None, state_dir: Path, media_dir: Path,
+    runner: Runner, logger: Logger, env: dict[str, str], args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Run one work end-to-end; retained as the single-worker interface."""
+    result = prepare_work(
+        config, creator, work, works_file, profile_file, state_dir, media_dir,
+        runner, logger, env, args,
+    )
+    return process_downstream(
+        config, creator, work, works_file, profile_file, state_dir, media_dir,
+        runner, logger, env, args, result,
+    )
+
+
+def asr_worker_count(config: dict[str, Any], args: argparse.Namespace, work_count: int) -> int:
+    configured = args.asr_workers
+    if configured is None:
+        configured = section(config, "asr").get("max_workers", 4)
+    try:
+        workers = int(configured)
+    except (TypeError, ValueError) as exc:
+        raise PipelineError(f"asr.max_workers 必须是整数: {configured}") from exc
+    if workers < 1:
+        raise PipelineError("ASR 并发数必须至少为 1。")
+    return min(workers, max(1, work_count))
 
 
 def process_creator(
@@ -614,6 +789,9 @@ def process_creator(
     logger.write(f"{name} 本轮选择 {len(selected)} / {len(all_works)} 条作品")
     state_dir = path_from(config.get("state_dir"), DEFAULT_STATE_DIR) or DEFAULT_STATE_DIR
     media_dir = path_from(config.get("media_dir"), DEFAULT_MEDIA_DIR) or DEFAULT_MEDIA_DIR
+    result["backup_mappings"] = sync_creator_backup_mappings(
+        config, creator, profile_file, state_dir, runner, logger, env, args,
+    )
 
     if not args.dry_run:
         for work in selected:
@@ -649,17 +827,61 @@ def process_creator(
             set_status(state, "feishu_synced", "success" if sync_ok else "failed", result.get("feishu_sync_error", ""))
             write_json(state_path, state)
 
+    workers = asr_worker_count(config, args, len(selected))
+    logger.write(f"{name} ASR/文案纠正并发数: {workers}")
+    prepared: dict[str, dict[str, Any]] = {}
+    work_by_id = {str(work["aweme_id"]): work for work in selected}
+    if workers == 1:
+        for work in selected:
+            item = prepare_work(
+                config, creator, work, works_file, profile_file, state_dir, media_dir,
+                runner, logger, env, args,
+            )
+            prepared[item["aweme_id"]] = item
+            if args.fail_fast and "failed" in item["stages"].values():
+                raise PipelineError(f"作品 {item['aweme_id']} 存在失败阶段。")
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="asr") as executor:
+            futures = {
+                executor.submit(
+                    prepare_work,
+                    config, creator, work, works_file, profile_file, state_dir, media_dir,
+                    runner, logger, env, args,
+                ): str(work["aweme_id"])
+                for work in selected
+            }
+            for future in as_completed(futures):
+                work_id = futures[future]
+                try:
+                    item = future.result()
+                except Exception as exc:
+                    logger.write(f"作品预处理异常 {work_id}: {exc}")
+                    item = {
+                        "aweme_id": work_id,
+                        "title": title_of(work_by_id[work_id]),
+                        "stages": {"transcribed": "failed", "corrected": "blocked"},
+                    }
+                prepared[work_id] = item
+                if args.fail_fast and "failed" in item["stages"].values():
+                    for pending in futures:
+                        pending.cancel()
+                    raise PipelineError(f"作品 {work_id} 存在失败阶段。")
+
+    # Creator-level mappings and backup destinations are shared resources.
+    # Keep delivery serial while the expensive ASR preparation is parallel.
     for work in selected:
-        work_result = process_work(
+        work_id = str(work["aweme_id"])
+        work_result = process_downstream(
             config, creator, work, works_file, profile_file, state_dir, media_dir,
-            runner, logger, env, args,
+            runner, logger, env, args, prepared[work_id],
         )
         result["works"].append(work_result)
         if args.fail_fast and "failed" in work_result["stages"].values():
             raise PipelineError(f"作品 {work_result['aweme_id']} 存在失败阶段。")
 
     failed_work = any("failed" in item["stages"].values() for item in result["works"])
-    result["status"] = "partial_failure" if (not collection_ok or not sync_ok or failed_work) else "success"
+    mapping_failed = "failed" in result["backup_mappings"].values()
+    result["status"] = "partial_failure" if (not collection_ok or not sync_ok or mapping_failed or failed_work) else "success"
     logger.write(f"========== 达人结束: {name}，状态 {result['status']} ==========")
     return result
 
@@ -670,6 +892,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--creator", action="append", default=[], help="只运行指定达人 key，可重复")
     parser.add_argument("--aweme-id", action="append", default=[], help="只处理指定作品 ID，可重复")
     parser.add_argument("--max-works", type=int, default=None, help="每个达人最多处理条数；0 表示不限")
+    parser.add_argument(
+        "--asr-workers", type=int, default=None,
+        help="视频转音频和 ASR 并发数；默认读取 asr.max_workers，未配置时为 4",
+    )
     parser.add_argument("--skip-collect", action="store_true")
     parser.add_argument("--normalize-only", action="store_true", help="采集阶段只规范化已有 MediaCrawler 输出")
     parser.add_argument("--skip-feishu-sync", action="store_true")

@@ -31,7 +31,7 @@ MediaCrawler 采集示例：
 ```powershell
 $env:MEDIACRAWLER_DIR = "D:\path\to\MediaCrawler"
 python douyin_creator_monitor\scripts\collect_douyin_creator_with_mediacrawler.py `
-  --creator-url "https://www.douyin.com/user/MS4wLjABAAAAoePkj5ldelmgGm4fSjvGmaayTHyvuwq6XIz_1Occ9uc" `
+  --creator-url "https://www.douyin.com/user/REPLACE_WITH_SEC_USER_ID" `
   --expect-min-count 43 `
   --clean-media-output
 ```
@@ -82,3 +82,4 @@ $env:BAILIAN_UPLOAD_COMMAND = "your-upload-command --file {file}"
 ## IMA 备份脚本
 
 - `backup_transcripts_to_ima.py`: 把本地 `.txt` 文案按“博主 -> IMA 知识库/文件夹”映射备份到腾讯 IMA。真实凭证和映射文件放在 `douyin_creator_monitor/local/`，提交到 Git 的只有模板和说明。
+- `sync_creator_backup_mapping_to_feishu.py`: 读取三个备份脚本生成的目录元数据，只把非空的目录名称、ID、路径和同步状态写回飞书达人基础信息表。

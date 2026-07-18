@@ -53,6 +53,7 @@ class CreatorTarget:
     knowledge_base_name: str
     folder_id: str = ""
     folder_name: str = ""
+    folder_created: bool = False
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -167,6 +168,142 @@ def get_target(mapping_path: Path, creator_name: str) -> CreatorTarget:
         folder_id=str(merged.get("folder_id") or "").strip(),
         folder_name=str(merged.get("folder_name") or "").strip(),
     )
+
+
+def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.replace(path)
+
+
+def folder_id_from_item(item: dict[str, Any]) -> str:
+    value = str(item.get("folder_id") or item.get("media_id") or "").strip()
+    return value if value.startswith("folder_") else ""
+
+
+def find_exact_folder(credentials: ImaCredentials, target: CreatorTarget) -> str:
+    matches: list[str] = []
+    cursor = ""
+    seen_cursors: set[str] = set()
+    while cursor not in seen_cursors:
+        seen_cursors.add(cursor)
+        data = ima_api(
+            credentials,
+            "openapi/wiki/v1/search_knowledge",
+            {"query": target.folder_name, "knowledge_base_id": target.knowledge_base_id, "cursor": cursor},
+        )
+        for item in data.get("info_list") or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or item.get("title") or "").strip()
+            folder_id = folder_id_from_item(item)
+            if name == target.folder_name and folder_id:
+                matches.append(folder_id)
+        if data.get("is_end", True):
+            break
+        cursor = str(data.get("next_cursor") or "")
+        if not cursor:
+            break
+    unique = list(dict.fromkeys(matches))
+    if len(unique) > 1:
+        raise ImaBackupError(
+            f"IMA 知识库中存在多个同名文件夹「{target.folder_name}」，请人工清理后再运行。"
+        )
+    return unique[0] if unique else ""
+
+
+def persist_target_mapping(mapping_path: Path, target: CreatorTarget) -> None:
+    data = load_json(mapping_path)
+    creators = data.get("creators")
+    if not isinstance(creators, list):
+        creators = []
+        data["creators"] = creators
+    normalized = target.creator_name.casefold()
+    selected: dict[str, Any] | None = None
+    for item in creators:
+        if not isinstance(item, dict):
+            continue
+        names = [str(item.get("creator_name") or "")]
+        aliases = item.get("aliases")
+        if isinstance(aliases, list):
+            names.extend(str(alias) for alias in aliases)
+        if any(name.casefold() == normalized for name in names if name):
+            selected = item
+            break
+    if selected is None:
+        selected = {"creator_name": target.creator_name}
+        creators.append(selected)
+    selected.update(
+        {
+            "knowledge_base_id": target.knowledge_base_id,
+            "knowledge_base_name": target.knowledge_base_name,
+            "folder_id": target.folder_id,
+            "folder_name": target.folder_name,
+        }
+    )
+    write_json_atomic(mapping_path, data)
+
+
+def ensure_creator_folder(
+    credentials: ImaCredentials,
+    mapping_path: Path,
+    creator_name: str,
+) -> CreatorTarget:
+    target = get_target(mapping_path, creator_name)
+    folder_name = target.folder_name or target.creator_name or creator_name
+    if target.folder_id:
+        return CreatorTarget(**{**target.__dict__, "folder_name": folder_name})
+
+    searchable = CreatorTarget(**{**target.__dict__, "folder_name": folder_name})
+    folder_id = find_exact_folder(credentials, searchable)
+    created = False
+    if not folder_id:
+        data = ima_api(
+            credentials,
+            "openapi/wiki/v1/create_folder",
+            {"knowledge_base_id": target.knowledge_base_id, "name": folder_name},
+        )
+        folder_id = str(data.get("folder_id") or data.get("media_id") or "").strip()
+        if not folder_id.startswith("folder_"):
+            raise ImaBackupError(f"IMA 创建文件夹成功但未返回有效 folder_id: {data}")
+        created = True
+
+    ensured = CreatorTarget(
+        creator_name=target.creator_name,
+        knowledge_base_id=target.knowledge_base_id,
+        knowledge_base_name=target.knowledge_base_name,
+        folder_id=folder_id,
+        folder_name=folder_name,
+        folder_created=created,
+    )
+    persist_target_mapping(mapping_path, ensured)
+    return ensured
+
+
+def target_metadata(target: CreatorTarget) -> dict[str, Any]:
+    return {
+        "platform": "ima",
+        "creator_name": target.creator_name,
+        "directory": {
+            "name": target.folder_name,
+            "id": target.folder_id,
+            "path": f"{target.knowledge_base_name}/{target.folder_name}",
+            "created": target.folder_created,
+        },
+        "feishu_fields": {
+            "IMA知识库名称": target.knowledge_base_name,
+            "IMA知识库ID": target.knowledge_base_id,
+            "IMA文件夹名称": target.folder_name,
+            "IMA文件夹ID": target.folder_id,
+            "IMA同步状态": "已映射",
+        },
+    }
+
+
+def write_metadata(path_value: str | None, target: CreatorTarget) -> None:
+    if path_value:
+        write_json_atomic(Path(path_value), target_metadata(target))
 
 
 def preflight_txt(file_path: Path) -> dict[str, Any]:
@@ -435,6 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
     upload_parser.add_argument("--creator-name", required=True)
     upload_parser.add_argument("--file", required=True)
     upload_parser.add_argument("--on-duplicate", choices=["timestamp", "skip", "fail"], default="timestamp")
+    upload_parser.add_argument("--metadata-output", help="Write ensured IMA folder metadata as JSON.")
     upload_parser.set_defaults(func=handle_upload)
 
     upload_dir_parser = subparsers.add_parser("upload-dir", help="Upload TXT transcripts under a directory.")
@@ -442,7 +580,13 @@ def build_parser() -> argparse.ArgumentParser:
     upload_dir_parser.add_argument("--input-dir", required=True)
     upload_dir_parser.add_argument("--pattern", default="*.txt")
     upload_dir_parser.add_argument("--on-duplicate", choices=["timestamp", "skip", "fail"], default="timestamp")
+    upload_dir_parser.add_argument("--metadata-output", help="Write ensured IMA folder metadata as JSON.")
     upload_dir_parser.set_defaults(func=handle_upload_dir)
+
+    ensure_parser = subparsers.add_parser("ensure-folder", help="Find or create one creator folder in IMA.")
+    ensure_parser.add_argument("--creator-name", required=True)
+    ensure_parser.add_argument("--metadata-output", required=True)
+    ensure_parser.set_defaults(func=handle_ensure_folder)
     return parser
 
 
@@ -454,9 +598,17 @@ def handle_search_folder(args: argparse.Namespace) -> None:
     search_folder(load_credentials(), args.knowledge_base_id, args.query)
 
 
+def handle_ensure_folder(args: argparse.Namespace) -> None:
+    target = ensure_creator_folder(load_credentials(), Path(args.mapping), args.creator_name)
+    write_metadata(args.metadata_output, target)
+    action = "已创建" if target.folder_created else "已定位"
+    print(f"{action} IMA 达人文件夹: {target.knowledge_base_name}/{target.folder_name}")
+
+
 def handle_upload(args: argparse.Namespace) -> None:
     credentials = load_credentials()
-    target = get_target(Path(args.mapping), args.creator_name)
+    target = ensure_creator_folder(credentials, Path(args.mapping), args.creator_name)
+    write_metadata(args.metadata_output, target)
     uploaded = upload_file(credentials, target, Path(args.file), args.on_duplicate)
     if uploaded is None:
         print(f"已跳过同名文件: {Path(args.file).name}")
@@ -469,7 +621,8 @@ def handle_upload(args: argparse.Namespace) -> None:
 
 def handle_upload_dir(args: argparse.Namespace) -> None:
     credentials = load_credentials()
-    target = get_target(Path(args.mapping), args.creator_name)
+    target = ensure_creator_folder(credentials, Path(args.mapping), args.creator_name)
+    write_metadata(args.metadata_output, target)
     files = iter_files(Path(args.input_dir), args.pattern)
     if not files:
         print("没有找到需要上传的 TXT 文件。")

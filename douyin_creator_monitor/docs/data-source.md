@@ -28,7 +28,7 @@ douyin_creator_monitor/runtime/zhiliao-works-from-mediacrawler.json
 ```powershell
 $env:MEDIACRAWLER_DIR = "D:\path\to\MediaCrawler"
 python douyin_creator_monitor\scripts\collect_douyin_creator_with_mediacrawler.py `
-  --creator-url "https://www.douyin.com/user/MS4wLjABAAAAoePkj5ldelmgGm4fSjvGmaayTHyvuwq6XIz_1Occ9uc" `
+  --creator-url "https://www.douyin.com/user/REPLACE_WITH_SEC_USER_ID" `
   --expect-min-count 43 `
   --clean-media-output
 ```
@@ -39,7 +39,7 @@ python douyin_creator_monitor\scripts\collect_douyin_creator_with_mediacrawler.p
 
 ```powershell
 python douyin_creator_monitor\scripts\collect_douyin_creator_with_mediacrawler.py `
-  --creator-url "https://www.douyin.com/user/MS4wLjABAAAAoePkj5ldelmgGm4fSjvGmaayTHyvuwq6XIz_1Occ9uc" `
+  --creator-url "https://www.douyin.com/user/REPLACE_WITH_SEC_USER_ID" `
   --media-crawler-dir "D:\path\to\MediaCrawler" `
   --normalize-only
 ```
@@ -149,7 +149,7 @@ douyin_creator_monitor/runtime/mediacrawler-output/douyin/jsonl/creator_contents
 2026-07-16 已在用户已登录的 Chrome 标签页中验证成功。目标主页为：
 
 ```text
-https://www.douyin.com/user/MS4wLjABAAAAoePkj5ldelmgGm4fSjvGmaayTHyvuwq6XIz_1Occ9uc?from_tab_name=main
+https://www.douyin.com/user/REPLACE_WITH_SEC_USER_ID?from_tab_name=main
 ```
 
 成功方法不是把签名 URL 拿到浏览器外重放，也不是在页面里直接 `fetch` 资源表中的 URL；这两种方式都可能返回 HTML。可靠方法是在页面真正触发接口前注入 `fetch`/`XMLHttpRequest` 响应体钩子，然后让抖音前端自己重新请求 `/aweme/v1/web/aweme/post/`。

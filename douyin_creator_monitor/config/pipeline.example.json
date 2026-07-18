@@ -15,6 +15,7 @@
   },
   "feishu": {
     "base_token_env": "FEISHU_BASE_TOKEN",
+    "creator_table_id": "REPLACE_WITH_FEISHU_CREATOR_TABLE_ID",
     "ids_file": "local/feishu-ids.md",
     "lark_cli": "../tools/lark-cli/lark-cli.exe",
     "work_id_field": "抖音作品ID",
@@ -24,6 +25,7 @@
   "asr": {
     "provider": "volcengine",
     "mode": "direct-url",
+    "max_workers": 4,
     "ffmpeg": "",
     "model": "",
     "endpoint": ""

@@ -354,17 +354,45 @@ def build_output_path(base_dir: Path, creator_dir_name: str, work: dict[str, Any
     return base_dir / sanitize_path_part(creator_dir_name, fallback="未知达人") / f"{publish_date}_{aweme_id}_{safe_title}.md"
 
 
+def directory_metadata(directory: Path, creator_dir_name: str, created: bool) -> dict[str, Any]:
+    return {
+        "platform": "obsidian",
+        "directory": {
+            "name": creator_dir_name,
+            "id": "",
+            "path": str(directory.resolve()),
+            "created": created,
+        },
+        "feishu_fields": {
+            "Obsidian文件夹名称": creator_dir_name,
+            "Obsidian文件夹路径": str(directory.resolve()),
+            "Obsidian同步状态": "已映射",
+        },
+    }
+
+
+def write_metadata(path: Path | None, value: dict[str, Any]) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.replace(path)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="把火山转写原始文案保存到 Obsidian Z_Original，按达人目录归档")
-    parser.add_argument("--transcript", type=Path, required=True, help="完整原始文案 TXT 文件")
-    parser.add_argument("--aweme-id", required=True, help="抖音作品 ID")
-    parser.add_argument("--works-file", type=Path, required=True, help="MediaCrawler 规范化作品 JSON")
+    parser.add_argument("--transcript", type=Path, help="完整原始文案 TXT 文件")
+    parser.add_argument("--aweme-id", help="抖音作品 ID")
+    parser.add_argument("--works-file", type=Path, help="MediaCrawler 规范化作品 JSON")
     parser.add_argument("--profile-file", type=Path, default=None, help="达人主页信息 JSON，可选")
     parser.add_argument("--creator-name", default="", help="达人显示名称；不填时尝试从 profile JSON 读取")
     parser.add_argument("--creator-dir-name", default="", help="Obsidian 下的达人目录名；不填时使用 creator-name")
     parser.add_argument("--obsidian-original-dir", type=Path, default=DEFAULT_OBSIDIAN_ORIGINAL_DIR, help="Obsidian 原始文案根目录")
     parser.add_argument("--template-file", type=Path, default=DEFAULT_OBSIDIAN_TEMPLATE_FILE, help="Obsidian 原始文案模板文件；模板内 CLEANING_RULES 区块会作为正文清洗规则来源")
     parser.add_argument("--overwrite", action="store_true", help="目标文件已存在时覆盖")
+    parser.add_argument("--ensure-creator-dir-only", action="store_true", help="只确保达人目录存在并输出映射")
+    parser.add_argument("--metadata-output", type=Path, help="目录映射 JSON 输出文件")
     return parser
 
 
@@ -372,16 +400,24 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
-        work = find_work(args.works_file, args.aweme_id)
         profile = read_json(args.profile_file) if args.profile_file else {}
-        transcript = read_text(args.transcript)
         creator_name = args.creator_name.strip() or str(profile.get("达人昵称") or profile.get("作品表名称") or "未知达人").strip()
         creator_dir_name = args.creator_dir_name.strip() or creator_name
+        creator_dir = args.obsidian_original_dir / sanitize_path_part(creator_dir_name, fallback="未知达人")
+        created = not creator_dir.exists()
+        creator_dir.mkdir(parents=True, exist_ok=True)
+        write_metadata(args.metadata_output, directory_metadata(creator_dir, creator_dir_name, created))
+        if args.ensure_creator_dir_only:
+            print(f"已确认 Obsidian 达人目录: {creator_dir}")
+            return 0
+        if not args.transcript or not args.aweme_id or not args.works_file:
+            raise ObsidianExportError("正式导出需要同时提供 --transcript、--aweme-id 和 --works-file。")
+        work = find_work(args.works_file, args.aweme_id)
+        transcript = read_text(args.transcript)
         output_path = build_output_path(args.obsidian_original_dir, creator_dir_name, work, args.aweme_id)
         if output_path.exists() and not args.overwrite:
             print(f"已跳过，目标文件已存在: {output_path}")
             return 0
-        output_path.parent.mkdir(parents=True, exist_ok=True)
         note = build_note(
             aweme_id=args.aweme_id,
             transcript=transcript,

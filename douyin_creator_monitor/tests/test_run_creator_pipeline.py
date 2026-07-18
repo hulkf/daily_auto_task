@@ -1,3 +1,4 @@
+import argparse
 import importlib.util
 import unittest
 from pathlib import Path
@@ -36,6 +37,17 @@ class PipelineHelpersTest(unittest.TestCase):
         paths = PIPELINE.artifact_paths(Path("runtime/media"), "123", "volcengine")
         self.assertEqual(paths["raw_text"].name, "123.volc-url.txt")
         self.assertEqual(paths["final"].name, "123.final.txt")
+
+    def test_asr_worker_count_uses_cli_then_config_and_caps_to_work_count(self):
+        args = argparse.Namespace(asr_workers=None)
+        self.assertEqual(PIPELINE.asr_worker_count({"asr": {"max_workers": 6}}, args, 3), 3)
+        args.asr_workers = 2
+        self.assertEqual(PIPELINE.asr_worker_count({"asr": {"max_workers": 6}}, args, 9), 2)
+
+    def test_asr_worker_count_rejects_zero(self):
+        args = argparse.Namespace(asr_workers=0)
+        with self.assertRaises(PIPELINE.PipelineError):
+            PIPELINE.asr_worker_count({}, args, 10)
 
 
 if __name__ == "__main__":

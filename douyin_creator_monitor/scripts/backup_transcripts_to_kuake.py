@@ -43,6 +43,14 @@ class KuakeCredentials:
     puus: str = ""
 
 
+@dataclass(frozen=True)
+class RemoteDirectory:
+    name: str
+    path: str
+    folder_id: str = ""
+    created: bool = False
+
+
 def load_json(path: Path) -> dict[str, Any]:
     try:
         return json.loads(path.read_text(encoding="utf-8-sig"))
@@ -158,22 +166,64 @@ def split_remote_path(path: str) -> tuple[str, str]:
     return parent or "/", name
 
 
-def ensure_dir(kuake_exe: Path, credentials: KuakeCredentials, path: str) -> str:
+def ensure_dir_details(kuake_exe: Path, credentials: KuakeCredentials, path: str) -> RemoteDirectory:
     clean = path.strip().replace("\\", "/") or "/"
     if not clean.startswith("/"):
         clean = "/" + clean
     if clean == "/":
-        return "/"
+        return RemoteDirectory(name="/", path="/")
     current = "/"
+    final_item: dict[str, Any] = {}
+    created_any = False
     for part in [part for part in clean.split("/") if part]:
         items = list_dir(kuake_exe, credentials, current)
         existing = next((item for item in items if item.get("dir") and item.get("file_name") == part), None)
         if existing:
             current = str(existing.get("path") or f"{current.rstrip('/')}/{part}")
+            final_item = existing
             continue
         run_kuake(kuake_exe, credentials, ["create", part, current])
+        created_any = True
+        created_items = list_dir(kuake_exe, credentials, current)
+        final_item = next(
+            (item for item in created_items if item.get("dir") and item.get("file_name") == part),
+            {},
+        )
         current = f"{current.rstrip('/')}/{part}"
-    return current
+    return RemoteDirectory(
+        name=str(final_item.get("file_name") or clean.rsplit("/", 1)[-1]),
+        path=str(final_item.get("path") or current),
+        folder_id=str(final_item.get("fid") or final_item.get("id") or ""),
+        created=created_any,
+    )
+
+
+def ensure_dir(kuake_exe: Path, credentials: KuakeCredentials, path: str) -> str:
+    return ensure_dir_details(kuake_exe, credentials, path).path
+
+
+def write_metadata(path: Path | None, directory: RemoteDirectory) -> None:
+    if path is None:
+        return
+    value = {
+        "platform": "kuake",
+        "directory": {
+            "name": directory.name,
+            "id": directory.folder_id,
+            "path": directory.path,
+            "created": directory.created,
+        },
+        "feishu_fields": {
+            "夸克文件夹名称": directory.name,
+            "夸克文件夹ID": directory.folder_id,
+            "夸克文件夹路径": directory.path,
+            "夸克同步状态": "已映射",
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(path.suffix + ".tmp")
+    temp.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temp.replace(path)
 
 
 def upload_file(
@@ -206,8 +256,19 @@ def cmd_list(args: argparse.Namespace) -> int:
 
 def cmd_ensure_dir(args: argparse.Namespace) -> int:
     credentials, _ = load_credentials(args.local_env)
-    path = ensure_dir(args.kuake_exe, credentials, args.path)
-    print(f"已确认目录: {path}")
+    directory = ensure_dir_details(args.kuake_exe, credentials, args.path)
+    write_metadata(args.metadata_output, directory)
+    print(f"已确认目录: {directory.path}")
+    return 0
+
+
+def cmd_ensure_creator_dir(args: argparse.Namespace) -> int:
+    credentials, default_backup_dir = load_credentials(args.local_env)
+    base_dir = args.base_dir or default_backup_dir
+    remote_dir = args.remote_dir or join_remote_path(base_dir, sanitize_path_part(args.creator_name))
+    directory = ensure_dir_details(args.kuake_exe, credentials, remote_dir)
+    write_metadata(args.metadata_output, directory)
+    print(f"已确认夸克达人目录: {directory.path}")
     return 0
 
 
@@ -228,13 +289,17 @@ def cmd_upload(args: argparse.Namespace) -> int:
         if missing:
             raise KuakeBackupError(f"自动命名需要同时提供: {', '.join(missing)}")
         remote_name = build_transcript_filename(args.video_date, args.video_id, args.title)
+    directory = ensure_dir_details(args.kuake_exe, credentials, remote_dir) if args.create_dir else RemoteDirectory(
+        name=remote_dir.rstrip("/").rsplit("/", 1)[-1], path=remote_dir
+    )
+    write_metadata(args.metadata_output, directory)
     remote_path = upload_file(
         args.kuake_exe,
         credentials,
         args.file,
-        remote_dir=remote_dir,
+        remote_dir=directory.path,
         remote_name=remote_name,
-        create_dir=args.create_dir,
+        create_dir=False,
     )
     print(f"已上传: {args.file} -> {remote_path}")
     return 0
@@ -251,13 +316,17 @@ def cmd_upload_dir(args: argparse.Namespace) -> int:
     txt_files = [path for path in files if path.is_file() and path.suffix.lower() == ".txt"]
     if not txt_files:
         raise KuakeBackupError(f"目录中没有匹配的 TXT 文件: {args.input_dir} / {args.pattern}")
+    directory = ensure_dir_details(args.kuake_exe, credentials, remote_dir) if args.create_dir else RemoteDirectory(
+        name=remote_dir.rstrip("/").rsplit("/", 1)[-1], path=remote_dir
+    )
+    write_metadata(args.metadata_output, directory)
     for path in txt_files:
         remote_path = upload_file(
             args.kuake_exe,
             credentials,
             path,
-            remote_dir=remote_dir,
-            create_dir=args.create_dir,
+            remote_dir=directory.path,
+            create_dir=False,
         )
         print(f"已上传: {path} -> {remote_path}")
     return 0
@@ -275,7 +344,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     ensure_parser = subparsers.add_parser("ensure-dir", help="确认目录存在，不存在则创建")
     ensure_parser.add_argument("path")
+    ensure_parser.add_argument("--metadata-output", type=Path)
     ensure_parser.set_defaults(func=cmd_ensure_dir)
+
+    creator_dir_parser = subparsers.add_parser("ensure-creator-dir", help="确认博主专属目录存在并输出映射")
+    creator_dir_parser.add_argument("--creator-name", required=True)
+    creator_dir_parser.add_argument("--base-dir", default="")
+    creator_dir_parser.add_argument("--remote-dir", default="")
+    creator_dir_parser.add_argument("--metadata-output", type=Path, required=True)
+    creator_dir_parser.set_defaults(func=cmd_ensure_creator_dir)
 
     upload_parser = subparsers.add_parser("upload", help="上传单个 TXT 文案")
     upload_parser.add_argument("--file", type=Path, required=True)
@@ -287,6 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
     upload_parser.add_argument("--remote-dir", default="", help="夸克目标目录，默认读取 local 配置")
     upload_parser.add_argument("--remote-name", default="", help="上传后的文件名，默认用本地文件名")
     upload_parser.add_argument("--create-dir", action="store_true", help="目标目录不存在时自动创建")
+    upload_parser.add_argument("--metadata-output", type=Path)
     upload_parser.set_defaults(func=cmd_upload)
 
     upload_dir_parser = subparsers.add_parser("upload-dir", help="上传目录中的 TXT 文案")
@@ -296,6 +374,7 @@ def build_parser() -> argparse.ArgumentParser:
     upload_dir_parser.add_argument("--creator-name", default="", help="博主名称；提供后默认上传到 根目录/博主名称")
     upload_dir_parser.add_argument("--remote-dir", default="", help="夸克目标目录，默认读取 local 配置")
     upload_dir_parser.add_argument("--create-dir", action="store_true", help="目标目录不存在时自动创建")
+    upload_dir_parser.add_argument("--metadata-output", type=Path)
     upload_dir_parser.set_defaults(func=cmd_upload_dir)
     return parser
 

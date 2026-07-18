@@ -67,7 +67,11 @@ douyin_creator_monitor/scripts/run_creator_pipeline.py
 3. 从作品数据读取 music_download_url，调用火山 ASR（或配置的其他 ASR）。
 4. 按达人配置的领域词库执行文案纠正。
 5. 把纠正后的全文回写飞书对应作品记录。
-6. 分别备份到 IMA、夸克网盘和 Obsidian；三个备份阶段互相独立。
+6. 分别确认 IMA、夸克网盘和 Obsidian 的达人专属目录；不存在时自动创建。
+7. 检查三个平台的目录名称、ID（平台提供时）和路径与飞书达人基础信息表是否一致；仅新建目录、字段缺失或值错误时回写差异字段。
+8. 分别备份到 IMA、夸克网盘和 Obsidian；三个备份阶段互相独立。
+
+视频转音频、火山 ASR 和文案纠正按作品受控并发，默认并发数为 4。每条作品使用独立临时目录、产物文件和状态文件；飞书批量同步、达人目录映射与备份仍串行执行，避免共享目录或元数据竞争。
 
 ### 配置文件
 
@@ -85,6 +89,8 @@ douyin_creator_monitor/local/pipeline.json
 
 本地配置已被 .gitignore 忽略，可填写真实的达人主页、飞书作品表 ID、MediaCrawler 路径和本地工具路径。飞书 Base token、IMA 凭证、夸克 Cookie 等仍放在原有环境变量或 local 私有文件中，不要直接写进可提交模板。
 
+`feishu.creator_table_id` 必须配置为达人基础信息表 ID。流水线默认从 `creator_url` 提取 `SecUID` 定位达人记录；特殊达人可以额外设置 `feishu_match_field` 和 `feishu_match_value`。
+
 每个达人至少配置：
 
 - key：命令行选择达人时使用的稳定标识。
@@ -95,6 +101,8 @@ douyin_creator_monitor/local/pipeline.json
 - works_file：规范化作品 JSON 的输出位置。
 - profile_file：Obsidian 顶部基础信息所需的达人资料，可选。
 - correction_domain：如 douyin_shop_ads 或 ai_media。
+
+全局并发数可在 `asr.max_workers` 中配置。火山账号配额较低或本机需要同时执行 FFmpeg 转码时，可以先设为 2；网络和配额稳定后再逐步提高。命令行 `--asr-workers` 会临时覆盖配置文件。
 
 ### 运行命令
 
@@ -114,6 +122,12 @@ python .\douyin_creator_monitor\scripts\run_creator_pipeline.py
 
 ~~~powershell
 python .\douyin_creator_monitor\scripts\run_creator_pipeline.py --creator zhiliao --max-works 3
+~~~
+
+临时使用 6 路 ASR 并发：
+
+~~~powershell
+python .\douyin_creator_monitor\scripts\run_creator_pipeline.py --creator zhiliao --asr-workers 6
 ~~~
 
 只规范化已经存在的 MediaCrawler 输出，不重新启动抓取：
@@ -157,7 +171,7 @@ douyin_creator_monitor/logs/pipeline-YYYYMMDD-HHMMSS.log
 --force-stage all
 ~~~
 
-IMA 默认使用 on_duplicate=skip，避免同名文案重复上传。夸克和 Obsidian 是否已成功以本地阶段状态为准；状态已成功时不会重复远程写入。
+IMA 默认使用 on_duplicate=skip，避免同名文案重复上传。目录确认和映射检查属于达人级步骤，每个达人每轮只执行一次，不会随作品数量重复检查；飞书现有映射完全正确时返回 `skipped`，不会执行写操作，只有新建目录或发现映射缺失/错误时才更新差异字段。夸克和 Obsidian 是否已成功以本地阶段状态为准；状态已成功时不会重复远程写入。
 
 单条作品的转写或某个备份失败时，流水线会保留已经成功的结果，并继续其他备份和后续作品。只要最终存在任一失败阶段，进程退出码就是 1，便于 Windows 任务计划程序识别失败。需要遇错立即停止时增加 --fail-fast。
 
