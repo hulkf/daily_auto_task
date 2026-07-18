@@ -121,6 +121,37 @@ def find_record_by_work_id(
     )
     records = find_records(payload)
     if not records:
+        # Base keyword search can return no rows for long numeric identifiers
+        # even when the exact text exists. Fall back to a field-scoped list and
+        # compare cell values exactly so transcript writeback stays reliable.
+        listed = run_lark(
+            cli,
+            [
+                "base",
+                "+record-list",
+                "--base-token",
+                base_token,
+                "--table-id",
+                table_id,
+                "--field-id",
+                work_id_field,
+                "--limit",
+                "200",
+                "--format",
+                "json",
+                "--as",
+                as_identity,
+            ],
+        )
+        data = listed.get("data") if isinstance(listed.get("data"), dict) else {}
+        rows = data.get("data") if isinstance(data.get("data"), list) else []
+        record_ids = data.get("record_id_list") if isinstance(data.get("record_id_list"), list) else []
+        records = [
+            {"record_id": record_id}
+            for row, record_id in zip(rows, record_ids)
+            if isinstance(row, list) and row and str(row[0] or "").strip() == work_id
+        ]
+    if not records:
         raise SystemExit(f"No Feishu record found for {work_id_field}={work_id}")
     if len(records) > 1:
         raise SystemExit(f"Multiple Feishu records found for {work_id_field}={work_id}; please clean duplicates first.")

@@ -22,6 +22,7 @@ def load_module(name: str):
 IMA = load_module("backup_transcripts_to_ima")
 KUAKE = load_module("backup_transcripts_to_kuake")
 SYNC = load_module("sync_creator_backup_mapping_to_feishu")
+WRITER = load_module("feishu_transcript_writer")
 OBSIDIAN = load_module("export_transcript_to_obsidian")
 
 
@@ -92,6 +93,37 @@ class KuakeDirectoryMappingTest(unittest.TestCase):
 
 
 class FeishuMappingPatchTest(unittest.TestCase):
+    def test_search_falls_back_to_exact_field_list_match(self):
+        responses = [
+            {"ok": True, "data": {"data": [], "record_id_list": []}},
+            {
+                "ok": True,
+                "data": {
+                    "data": [["阿笠AIGC电商"]],
+                    "record_id_list": ["rec_aligc"],
+                },
+            },
+        ]
+        with patch.object(SYNC, "run_lark", side_effect=responses):
+            record_id = SYNC.search_creator_record(
+                "lark-cli", "token", "table", "达人昵称", "阿笠AIGC电商", "user"
+            )
+        self.assertEqual(record_id, "rec_aligc")
+
+    def test_record_get_matrix_is_converted_to_field_mapping(self):
+        payload = {
+            "ok": True,
+            "data": {
+                "fields": ["达人昵称", "IMA同步状态"],
+                "data": [["阿笠AIGC电商", ["已映射"]]],
+                "record_id_list": ["rec_aligc"],
+            },
+        }
+        with patch.object(SYNC, "run_lark", return_value=payload):
+            fields = SYNC.get_record_fields("lark-cli", "token", "table", "rec_aligc", "user")
+        self.assertEqual(fields["达人昵称"], "阿笠AIGC电商")
+        self.assertEqual(fields["IMA同步状态"], ["已映射"])
+
     def test_empty_provider_id_does_not_clear_existing_feishu_value(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             metadata = Path(temp_dir) / "obsidian.json"
@@ -123,6 +155,25 @@ class FeishuMappingPatchTest(unittest.TestCase):
             SYNC.changed_fields(desired, existing),
             {"IMA文件夹ID": "folder_123"},
         )
+
+
+class FeishuTranscriptWriterFallbackTest(unittest.TestCase):
+    def test_work_id_search_falls_back_to_exact_field_list_match(self):
+        responses = [
+            {"ok": True, "data": {"data": [], "record_id_list": []}},
+            {
+                "ok": True,
+                "data": {
+                    "data": [["7662026755036761395"]],
+                    "record_id_list": ["rec_work"],
+                },
+            },
+        ]
+        with patch.object(WRITER, "run_lark", side_effect=responses):
+            record_id = WRITER.find_record_by_work_id(
+                "lark-cli", "token", "table", "7662026755036761395", "抖音作品ID", "user"
+            )
+        self.assertEqual(record_id, "rec_work")
 
 
 class ObsidianDirectoryMappingTest(unittest.TestCase):

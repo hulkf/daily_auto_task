@@ -99,7 +99,34 @@ def search_creator_record(
             "--limit", "10", "--format", "json", "--as", as_identity,
         ],
     )
-    return find_record_id(payload, match_field, match_value)
+    try:
+        return find_record_id(payload, match_field, match_value)
+    except MappingSyncError:
+        # Some Base tables do not return row objects from keyword search even
+        # for an exact text match. Use a field-scoped list as a deterministic
+        # fallback and compare the returned cell value ourselves.
+        listed = run_lark(
+            cli,
+            [
+                "base", "+record-list", "--base-token", base_token,
+                "--table-id", table_id, "--field-id", match_field,
+                "--limit", "200", "--format", "json", "--as", as_identity,
+            ],
+        )
+        data = listed.get("data") if isinstance(listed.get("data"), dict) else {}
+        rows = data.get("data") if isinstance(data.get("data"), list) else []
+        record_ids = data.get("record_id_list") if isinstance(data.get("record_id_list"), list) else []
+        matches = [
+            record_id
+            for row, record_id in zip(rows, record_ids)
+            if isinstance(row, list) and row and str(row[0] or "").strip() == match_value
+        ]
+        unique = list(dict.fromkeys(matches))
+        if not unique:
+            raise MappingSyncError(f"达人基础信息表中未找到 {match_field}={match_value}。")
+        if len(unique) > 1:
+            raise MappingSyncError(f"达人基础信息表中 {match_field}={match_value} 匹配到多条记录。")
+        return unique[0]
 
 
 def get_record_fields(
@@ -119,6 +146,13 @@ def get_record_fields(
             item_id = item.get("record_id") or item.get("id")
             if item_id in (None, record_id):
                 return fields
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    names = data.get("fields") if isinstance(data.get("fields"), list) else []
+    rows = data.get("data") if isinstance(data.get("data"), list) else []
+    record_ids = data.get("record_id_list") if isinstance(data.get("record_id_list"), list) else []
+    for row, item_id in zip(rows, record_ids):
+        if item_id == record_id and isinstance(row, list):
+            return {str(name): value for name, value in zip(names, row)}
     raise MappingSyncError(f"无法读取达人记录字段: {record_id}")
 
 
