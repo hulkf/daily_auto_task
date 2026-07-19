@@ -4,6 +4,7 @@ import importlib.util
 import io
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -16,6 +17,238 @@ SPEC.loader.exec_module(PIPELINE)
 
 
 class PipelineHelpersTest(unittest.TestCase):
+    def test_main_overlaps_next_creator_collection_with_previous_creator_processing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "pipeline.json"
+            config_path.write_text(
+                json.dumps({
+                    "state_dir": str(root / "state"),
+                    "log_dir": str(root / "logs"),
+                    "creators": [
+                        {"key": "a", "creator_name": "达人 A"},
+                        {"key": "b", "creator_name": "达人 B"},
+                    ],
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            a_processing_started = threading.Event()
+            b_collection_started = threading.Event()
+            a_processing_finished = threading.Event()
+            events: list[str] = []
+
+            def collect_phase(config, creator, runner, logger, env, args):
+                key = creator["key"]
+                events.append(f"collect:{key}")
+                if key == "b":
+                    self.assertTrue(a_processing_started.wait(5), "达人 A 文案处理没有与达人 B 采集重叠")
+                    self.assertFalse(a_processing_finished.is_set())
+                    b_collection_started.set()
+                return {"creator": creator, "result": {"key": key, "works": []}}
+
+            def process_phase(config, context, runner, logger, env, args):
+                key = context["creator"]["key"]
+                events.append(f"process:{key}:start")
+                if key == "a":
+                    a_processing_started.set()
+                    self.assertTrue(b_collection_started.wait(5), "达人 B 采集等待了达人 A 文案处理完成")
+                    a_processing_finished.set()
+                else:
+                    self.assertTrue(a_processing_finished.is_set(), "达人 B 文案处理早于达人 A 完成")
+                events.append(f"process:{key}:end")
+                return {"key": key, "status": "success", "works": []}
+
+            with patch.object(PIPELINE, "collect_creator_phase", side_effect=collect_phase), patch.object(
+                PIPELINE, "process_creator_phase", side_effect=process_phase,
+            ):
+                exit_code = PIPELINE.main(["--config", str(config_path), "--dry-run"])
+
+            self.assertEqual(exit_code, 0)
+            self.assertLess(events.index("collect:b"), events.index("process:a:end"))
+            self.assertLess(events.index("process:a:end"), events.index("process:b:start"))
+
+    def test_processing_failure_is_recorded_and_releases_next_creator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "pipeline.json"
+            config_path.write_text(
+                json.dumps({
+                    "state_dir": str(root / "state"),
+                    "log_dir": str(root / "logs"),
+                    "creators": [{"key": "a"}, {"key": "b"}],
+                }),
+                encoding="utf-8",
+            )
+            processed: list[str] = []
+            output: list[str] = []
+
+            def collect_phase(config, creator, runner, logger, env, args):
+                return {"creator": creator, "result": {"key": creator["key"], "works": []}}
+
+            def process_phase(config, context, runner, logger, env, args):
+                key = context["creator"]["key"]
+                processed.append(key)
+                if key == "a":
+                    raise RuntimeError("ASR unavailable")
+                return {"key": key, "status": "success", "works": []}
+
+            with patch.object(PIPELINE, "collect_creator_phase", side_effect=collect_phase), patch.object(
+                PIPELINE, "process_creator_phase", side_effect=process_phase,
+            ), patch.object(PIPELINE, "print_console", side_effect=lambda value, **kwargs: output.append(str(value))):
+                exit_code = PIPELINE.main(["--config", str(config_path), "--dry-run"])
+
+            summary = json.loads(output[-1])
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(processed, ["a", "b"])
+            self.assertEqual(summary["creators"][0]["status"], "failed")
+            self.assertIn("ASR unavailable", summary["creators"][0]["error"])
+            self.assertIn("transcript_processing_seconds", summary["creators"][0]["phase_timings"])
+            self.assertEqual(summary["creators"][1]["status"], "success")
+
+    def test_collection_failure_records_timing_and_does_not_stop_next_creator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "pipeline.json"
+            config_path.write_text(
+                json.dumps({
+                    "state_dir": str(root / "state"),
+                    "log_dir": str(root / "logs"),
+                    "creators": [{"key": "a"}, {"key": "b"}],
+                }),
+                encoding="utf-8",
+            )
+            collected: list[str] = []
+            processed: list[str] = []
+            output: list[str] = []
+
+            def collect_phase(config, creator, runner, logger, env, args):
+                key = creator["key"]
+                collected.append(key)
+                if key == "a":
+                    raise RuntimeError("collector unavailable")
+                return {"creator": creator, "result": {"key": key, "works": []}}
+
+            def process_phase(config, context, runner, logger, env, args):
+                key = context["creator"]["key"]
+                processed.append(key)
+                return {"key": key, "status": "success", "works": []}
+
+            with patch.object(PIPELINE, "collect_creator_phase", side_effect=collect_phase), patch.object(
+                PIPELINE, "process_creator_phase", side_effect=process_phase,
+            ), patch.object(PIPELINE, "print_console", side_effect=lambda value, **kwargs: output.append(str(value))):
+                exit_code = PIPELINE.main(["--config", str(config_path), "--dry-run"])
+
+            summary = json.loads(output[-1])
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(collected, ["a", "b"])
+            self.assertEqual(processed, ["b"])
+            self.assertEqual(summary["creators"][0]["status"], "failed")
+            self.assertIn("collector unavailable", summary["creators"][0]["error"])
+            self.assertIn("collection_and_sync_seconds", summary["creators"][0]["phase_timings"])
+            self.assertEqual(summary["creators"][1]["status"], "success")
+
+    def test_creator_processing_records_unexpected_work_failure_and_continues_remaining_works(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            creator = {"key": "a", "creator_name": "达人 A"}
+            works = [
+                {"aweme_id": "1", "create_time": 2},
+                {"aweme_id": "2", "create_time": 1},
+            ]
+            context = {
+                "creator": creator,
+                "key": "a",
+                "name": "达人 A",
+                "works_file": root / "works.json",
+                "profile_file": None,
+                "state_dir": root / "state",
+                "media_dir": root / "media",
+                "collection_state_file": root / "collection.json",
+                "result": {"key": "a", "works": [], "phase_timings": {}},
+                "selected": works,
+                "collection_ok": True,
+                "sync_ok": True,
+                "synced_record_ids": {},
+                "terminal": False,
+            }
+            args = argparse.Namespace(asr_workers=1, fail_fast=False, dry_run=True)
+            prepared_ids: list[str] = []
+            delivered_ids: list[str] = []
+
+            def prepare(config, creator, work, works_file, profile_file, state_dir, media_dir, runner, logger, env, args):
+                work_id = work["aweme_id"]
+                prepared_ids.append(work_id)
+                if work_id == "1":
+                    raise RuntimeError("bad audio")
+                return {"aweme_id": work_id, "title": "ok", "stages": {"transcribed": "success", "corrected": "success"}}
+
+            def deliver(config, creator, work, works_file, profile_file, state_dir, media_dir, runner, logger, env, args, result, record_id):
+                delivered_ids.append(work["aweme_id"])
+                return result
+
+            with patch.object(PIPELINE, "sync_creator_backup_mappings", return_value={}), patch.object(
+                PIPELINE, "prepare_work", side_effect=prepare,
+            ), patch.object(PIPELINE, "process_downstream", side_effect=deliver):
+                result = PIPELINE.process_creator_phase(
+                    {}, context, Mock(), PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+                )
+
+            self.assertEqual(prepared_ids, ["1", "2"])
+            self.assertEqual(delivered_ids, ["1", "2"])
+            self.assertEqual(result["works"][0]["stages"]["transcribed"], "failed")
+            self.assertIn("bad audio", result["works"][0]["error"])
+            self.assertEqual(result["works"][1]["stages"]["transcribed"], "success")
+            self.assertEqual(result["status"], "partial_failure")
+
+    def test_creator_processing_records_unexpected_delivery_failure_and_continues_remaining_works(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            creator = {"key": "a", "creator_name": "达人 A"}
+            works = [{"aweme_id": "1"}, {"aweme_id": "2"}]
+            context = {
+                "creator": creator,
+                "key": "a",
+                "name": "达人 A",
+                "works_file": root / "works.json",
+                "profile_file": None,
+                "state_dir": root / "state",
+                "media_dir": root / "media",
+                "collection_state_file": root / "collection.json",
+                "result": {"key": "a", "works": [], "phase_timings": {}},
+                "selected": works,
+                "collection_ok": True,
+                "sync_ok": True,
+                "synced_record_ids": {},
+                "terminal": False,
+            }
+            args = argparse.Namespace(asr_workers=1, fail_fast=False, dry_run=True)
+            delivered_ids: list[str] = []
+
+            def prepare(config, creator, work, works_file, profile_file, state_dir, media_dir, runner, logger, env, args):
+                return {
+                    "aweme_id": work["aweme_id"], "title": "ok",
+                    "stages": {"transcribed": "success", "corrected": "success"},
+                }
+
+            def deliver(config, creator, work, works_file, profile_file, state_dir, media_dir, runner, logger, env, args, result, record_id):
+                work_id = work["aweme_id"]
+                delivered_ids.append(work_id)
+                if work_id == "1":
+                    raise RuntimeError("writeback unavailable")
+                return result
+
+            with patch.object(PIPELINE, "sync_creator_backup_mappings", return_value={}), patch.object(
+                PIPELINE, "prepare_work", side_effect=prepare,
+            ), patch.object(PIPELINE, "process_downstream", side_effect=deliver):
+                result = PIPELINE.process_creator_phase(
+                    {}, context, Mock(), PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+                )
+
+            self.assertEqual(delivered_ids, ["1", "2"])
+            self.assertEqual(result["works"][0]["stages"]["downstream"], "failed")
+            self.assertIn("writeback unavailable", result["works"][0]["error"])
+            self.assertEqual(result["works"][1]["stages"]["transcribed"], "success")
+            self.assertEqual(result["status"], "partial_failure")
     def test_select_works_filters_sorts_and_limits(self):
         works = [
             {"aweme_id": "old", "create_time": 1},
@@ -55,6 +288,15 @@ class PipelineHelpersTest(unittest.TestCase):
             PIPELINE.fallback_work_text({"desc": "发布文案", "raw": {"title": "标题"}}),
             "标题",
         )
+
+    def test_asr_source_failure_can_fall_back_to_published_text(self):
+        self.assertTrue(PIPELINE.should_fallback_to_work_text(
+            "ASR query code 20000003: [Normal silence audio] no valid speech",
+        ))
+        self.assertTrue(PIPELINE.should_fallback_to_work_text(
+            "ASR query code 45000006: Invalid audio URI; audio download failed",
+        ))
+        self.assertFalse(PIPELINE.should_fallback_to_work_text("temporary HTTP 503"))
 
     def test_sensitive_command_values_are_masked(self):
         command = ["python", "script.py", "--audio-url", "signed-url", "--table-id", "tbl-secret"]

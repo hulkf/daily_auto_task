@@ -91,11 +91,15 @@ def find_work(works_file: Path, aweme_id: str) -> dict[str, Any]:
     raise ObsidianExportError(f"没有在作品 JSON 中找到作品 ID: {aweme_id}")
 
 
-def sanitize_path_part(value: str, *, fallback: str) -> str:
+def sanitize_path_part(value: str, *, fallback: str, limit: int = 80) -> str:
     value = (value or "").strip()
+    value = "".join(
+        char for char in value
+        if ord(char) <= 0xFFFF and ord(char) >= 32 and not 127 <= ord(char) <= 159
+    )
     value = re.sub(r"[\\/:*?\"<>|\r\n\t#]+", "_", value)
     value = re.sub(r"\s+", " ", value).strip(" ._")
-    return value[:80] or fallback
+    return value[:limit] or fallback
 
 
 def split_title_and_tags(desc: str) -> tuple[str, str]:
@@ -350,7 +354,7 @@ def build_note(
 def build_output_path(base_dir: Path, creator_dir_name: str, work: dict[str, Any], aweme_id: str) -> Path:
     title = work_title(work, aweme_id)
     publish_date = timestamp_to_local_text(work.get("create_time") or work.get("raw", {}).get("create_time"))[:10] or "unknown-date"
-    safe_title = sanitize_path_part(title, fallback="未命名作品")
+    safe_title = sanitize_path_part(title, fallback="未命名作品", limit=56)
     return base_dir / sanitize_path_part(creator_dir_name, fallback="未知达人") / f"{publish_date}_{aweme_id}_{safe_title}.md"
 
 
@@ -414,7 +418,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ObsidianExportError("正式导出需要同时提供 --transcript、--aweme-id 和 --works-file。")
         work = find_work(args.works_file, args.aweme_id)
         transcript = read_text(args.transcript)
-        output_path = build_output_path(args.obsidian_original_dir, creator_dir_name, work, args.aweme_id)
+        existing_paths = sorted(creator_dir.glob(f"*_{args.aweme_id}_*.md"))
+        output_path = existing_paths[0] if existing_paths else build_output_path(
+            args.obsidian_original_dir, creator_dir_name, work, args.aweme_id,
+        )
         if output_path.exists() and not args.overwrite:
             print(f"已跳过，目标文件已存在: {output_path}")
             return 0

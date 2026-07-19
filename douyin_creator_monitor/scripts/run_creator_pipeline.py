@@ -235,12 +235,36 @@ def fallback_work_text(work: dict[str, Any]) -> str:
     return value.strip()
 
 
+def should_fallback_to_work_text(asr_failure_detail: str) -> bool:
+    permanent_markers = (
+        "Normal silence audio",
+        "no valid speech",
+        "Invalid audio URI",
+        "audio download failed",
+    )
+    folded = asr_failure_detail.casefold()
+    return any(marker.casefold() in folded for marker in permanent_markers)
+
+
 def title_of(work: dict[str, Any]) -> str:
     raw = raw_work(work)
     value = str(raw.get("title") or work.get("title") or work.get("desc") or work.get("aweme_id") or "")
     value = HASHTAG_RE.sub("", value)
     value = re.sub(r"\s+", " ", value).strip()
     return value[:120] or str(work.get("aweme_id") or "未命名作品")
+
+
+def safe_external_title(work: dict[str, Any], limit: int = 56) -> str:
+    """Return a Windows/CLI-safe short title for external backup tools."""
+
+    value = title_of(work)
+    value = "".join(
+        char for char in value
+        if ord(char) <= 0xFFFF and ord(char) >= 32 and not 127 <= ord(char) <= 159
+    )
+    value = INVALID_PATH_RE.sub("_", value)
+    value = re.sub(r"\s+", " ", value).strip(" ._")
+    return value[:limit] or str(work.get("aweme_id") or "未命名作品")
 
 
 def date_of(work: dict[str, Any]) -> str:
@@ -671,7 +695,7 @@ def kuake_command(config: dict[str, Any], creator: dict[str, Any], work: dict[st
     command.extend([
         "upload", "--file", str(paths["final"]), "--creator-name", name,
         "--video-date", date_of(work), "--video-id", str(work["aweme_id"]),
-        "--title", title_of(work), "--create-dir",
+        "--title", safe_external_title(work), "--create-dir",
     ])
     append_option(command, "--base-dir", kuake.get("base_dir"))
     append_option(command, "--remote-dir", creator.get("kuake_remote_dir"))
@@ -1051,6 +1075,36 @@ def prepare_work(
             (paths["raw_text"], paths["raw_json"]),
         )
 
+    # Some Douyin posts are genuinely silent, while older signed audio URLs can
+    # expire before a historical backfill reaches them. After ASR returns one of
+    # these permanent source errors, use the published post text instead of
+    # retrying the same unprocessable audio forever.
+    if (
+        result["stages"]["transcribed"] == "failed"
+        and fallback_text
+        and bool(section(config, "asr").get("fallback_to_work_text_on_source_error", True))
+    ):
+        failure_detail = str(state.get("stages", {}).get("transcribed", {}).get("detail") or "")
+        if should_fallback_to_work_text(failure_detail):
+            paths["raw_text"].parent.mkdir(parents=True, exist_ok=True)
+            paths["raw_text"].write_text(fallback_text, encoding="utf-8")
+            paths["raw_json"].write_text(json.dumps({
+                "strategy": "work-text-fallback-after-asr-source-error",
+                "aweme_id": work_id,
+                "text": fallback_text,
+                "asr_error": failure_detail,
+            }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            set_status(
+                state,
+                "transcribed",
+                "success",
+                "ASR source unavailable; used published work text",
+                True,
+            )
+            write_json(state_path, state)
+            result["stages"]["transcribed"] = "success"
+            logger.write(f"Work {work_id}: ASR source unavailable; used published work text")
+
     transcribe_outcome = result["stages"]["transcribed"]
     if args.skip_correction:
         result["stages"]["corrected"] = "disabled"
@@ -1227,13 +1281,14 @@ def asr_worker_count(config: dict[str, Any], args: argparse.Namespace, work_coun
     return min(workers, max(1, work_count))
 
 
-def process_creator(
+def collect_creator_phase(
     config: dict[str, Any], creator: dict[str, Any], runner: Runner,
     logger: Logger, env: dict[str, str], args: argparse.Namespace,
 ) -> dict[str, Any]:
+    phase_started = time.perf_counter()
     key = creator_key(creator)
     name = str(creator.get("creator_name") or creator.get("creator_dir_name") or key)
-    logger.write(f"========== 达人开始: {name} ({key}) ==========")
+    logger.write(f"========== 达人采集开始: {name} ({key}) ==========")
     works_file = path_from(creator.get("works_file"), PROJECT_DIR / "runtime" / f"{key}-works-from-mediacrawler.json")
     profile_file = path_from(creator.get("profile_file"))
     media_output = path_from(creator.get("media_output_dir"), PROJECT_DIR / "runtime" / f"mediacrawler-output-{key}")
@@ -1242,7 +1297,10 @@ def process_creator(
     if works_file is None or media_output is None:
         raise PipelineError(f"达人 {key} 的路径配置无效。")
     collection_state_file = collection_state_path(state_dir, creator)
-    result: dict[str, Any] = {"key": key, "creator_name": name, "works_file": str(works_file), "works": []}
+    result: dict[str, Any] = {
+        "key": key, "creator_name": name, "works_file": str(works_file),
+        "works": [], "phase_timings": {},
+    }
 
     collection_ok = True
     collection_attempted = not args.skip_collect
@@ -1269,7 +1327,10 @@ def process_creator(
         if args.dry_run:
             logger.write(f"作品文件不存在，DRY-RUN 只展示到采集阶段: {works_file}")
             result["status"] = "planned_collection_only"
-            return result
+            result["phase_timings"]["collection_and_sync_seconds"] = round(
+                time.perf_counter() - phase_started, 3,
+            )
+            return {"creator": creator, "result": result, "terminal": True, "name": name}
         raise PipelineError(f"作品文件不存在: {works_file}")
 
     all_works = load_works(works_file)
@@ -1300,12 +1361,10 @@ def process_creator(
         result["status"] = "success" if collection_ok else "partial_failure"
         reason = "没有待处理的新作品" if pending_selection else "没有待补录的历史作品"
         logger.write(f"{name} {reason}，跳过飞书、ASR 和备份阶段")
-        logger.write(f"========== 达人结束: {name}，状态 {result['status']} ==========")
-        return result
-
-    result["backup_mappings"] = sync_creator_backup_mappings(
-        config, creator, profile_file, state_dir, runner, logger, env, args,
-    )
+        result["phase_timings"]["collection_and_sync_seconds"] = round(
+            time.perf_counter() - phase_started, 3,
+        )
+        return {"creator": creator, "result": result, "terminal": True, "name": name}
 
     if not args.dry_run:
         for work in selected:
@@ -1351,19 +1410,80 @@ def process_creator(
             set_status(state, "feishu_synced", "success" if sync_ok else "failed", result.get("feishu_sync_error", ""))
             write_json(state_path, state)
 
+    result["phase_timings"]["collection_and_sync_seconds"] = round(
+        time.perf_counter() - phase_started, 3,
+    )
+    logger.write(f"========== 达人采集结束: {name}，进入文案队列 ==========")
+    return {
+        "creator": creator,
+        "key": key,
+        "name": name,
+        "works_file": works_file,
+        "profile_file": profile_file,
+        "state_dir": state_dir,
+        "media_dir": media_dir,
+        "collection_state_file": collection_state_file,
+        "result": result,
+        "selected": selected,
+        "collection_ok": collection_ok,
+        "sync_ok": sync_ok,
+        "synced_record_ids": synced_record_ids,
+        "terminal": False,
+    }
+
+
+def process_creator_phase(
+    config: dict[str, Any], context: dict[str, Any], runner: Runner,
+    logger: Logger, env: dict[str, str], args: argparse.Namespace,
+) -> dict[str, Any]:
+    phase_started = time.perf_counter()
+    creator = context["creator"]
+    result = context["result"]
+    name = str(context.get("name") or creator.get("creator_name") or creator_key(creator))
+    logger.write(f"========== 达人文案处理开始: {name} ==========")
+    if context.get("terminal"):
+        result.setdefault("phase_timings", {})["transcript_processing_seconds"] = 0.0
+        logger.write(f"========== 达人结束: {name}，状态 {result['status']} ==========")
+        return result
+
+    key = str(context["key"])
+    works_file = context["works_file"]
+    profile_file = context["profile_file"]
+    state_dir = context["state_dir"]
+    media_dir = context["media_dir"]
+    collection_state_file = context["collection_state_file"]
+    selected = context["selected"]
+    collection_ok = bool(context["collection_ok"])
+    sync_ok = bool(context["sync_ok"])
+    synced_record_ids = context["synced_record_ids"]
+
+    result["backup_mappings"] = sync_creator_backup_mappings(
+        config, creator, profile_file, state_dir, runner, logger, env, args,
+    )
+
     workers = asr_worker_count(config, args, len(selected))
     logger.write(f"{name} ASR/文案纠正并发数: {workers}")
     prepared: dict[str, dict[str, Any]] = {}
     work_by_id = {str(work["aweme_id"]): work for work in selected}
     if workers == 1:
         for work in selected:
-            item = prepare_work(
-                config, creator, work, works_file, profile_file, state_dir, media_dir,
-                runner, logger, env, args,
-            )
-            prepared[item["aweme_id"]] = item
+            work_id = str(work["aweme_id"])
+            try:
+                item = prepare_work(
+                    config, creator, work, works_file, profile_file, state_dir, media_dir,
+                    runner, logger, env, args,
+                )
+            except Exception as exc:
+                logger.write(f"作品预处理异常 {work_id}: {exc}")
+                item = {
+                    "aweme_id": work_id,
+                    "title": title_of(work),
+                    "stages": {"transcribed": "failed", "corrected": "blocked"},
+                    "error": str(exc),
+                }
+            prepared[work_id] = item
             if args.fail_fast and "failed" in item["stages"].values():
-                raise PipelineError(f"作品 {item['aweme_id']} 存在失败阶段。")
+                raise PipelineError(f"作品 {work_id} 存在失败阶段。")
     else:
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="asr") as executor:
             futures = {
@@ -1395,13 +1515,20 @@ def process_creator(
     # Keep delivery serial while the expensive ASR preparation is parallel.
     for work in selected:
         work_id = str(work["aweme_id"])
-        work_result = process_downstream(
-            config, creator, work, works_file, profile_file, state_dir, media_dir,
-            runner, logger, env, args, prepared[work_id], synced_record_ids.get(work_id),
-        )
+        try:
+            work_result = process_downstream(
+                config, creator, work, works_file, profile_file, state_dir, media_dir,
+                runner, logger, env, args, prepared[work_id], synced_record_ids.get(work_id),
+            )
+        except Exception as exc:
+            logger.write(f"Work downstream processing failed {work_id}: {exc}")
+            work_result = dict(prepared[work_id])
+            work_result["stages"] = dict(work_result.get("stages", {}))
+            work_result["stages"]["downstream"] = "failed"
+            work_result["error"] = str(exc)
         result["works"].append(work_result)
         if args.fail_fast and "failed" in work_result["stages"].values():
-            raise PipelineError(f"作品 {work_result['aweme_id']} 存在失败阶段。")
+            raise PipelineError(f"Work {work_result['aweme_id']} has a failed stage.")
 
     failed_work = any("failed" in item["stages"].values() for item in result["works"])
     mapping_failed = "failed" in result["backup_mappings"].values()
@@ -1410,9 +1537,43 @@ def process_creator(
         complete_collection_pending(
             collection_state_file, works_file, [str(work["aweme_id"]) for work in selected],
         )
+    result.setdefault("phase_timings", {})["transcript_processing_seconds"] = round(
+        time.perf_counter() - phase_started, 3,
+    )
     logger.write(f"========== 达人结束: {name}，状态 {result['status']} ==========")
     return result
 
+
+def process_creator_phase_safely(
+    config: dict[str, Any], context: dict[str, Any], runner: Runner,
+    logger: Logger, env: dict[str, str], args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Record a creator-level failure and let the serial consumer advance."""
+    started = time.perf_counter()
+    try:
+        return process_creator_phase(config, context, runner, logger, env, args)
+    except Exception as exc:
+        creator = context["creator"]
+        result = context.get("result")
+        if not isinstance(result, dict):
+            result = {"key": creator_key(creator), "works": []}
+        result["status"] = "failed"
+        result["error"] = str(exc)
+        result.setdefault("works", [])
+        result.setdefault("phase_timings", {})["transcript_processing_seconds"] = round(
+            time.perf_counter() - started, 3,
+        )
+        logger.write(f"达人文案处理失败 {creator_key(creator)}: {exc}")
+        return result
+
+
+def process_creator(
+    config: dict[str, Any], creator: dict[str, Any], runner: Runner,
+    logger: Logger, env: dict[str, str], args: argparse.Namespace,
+) -> dict[str, Any]:
+    """Run one creator sequentially; retained for fail-fast and direct callers."""
+    context = collect_creator_phase(config, creator, runner, logger, env, args)
+    return process_creator_phase(config, context, runner, logger, env, args)
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="运行抖音达人文案完整流水线")
@@ -1493,17 +1654,62 @@ def main(argv: list[str] | None = None) -> int:
             "dry_run": args.dry_run, "creators": [],
         }
 
-        for creator in creators:
-            try:
-                creator_result = process_creator(config, creator, runner, logger, env, args)
-            except Exception as exc:
-                logger.write(f"达人任务失败 {creator_key(creator)}: {exc}")
-                creator_result = {"key": creator_key(creator), "status": "failed", "error": str(exc), "works": []}
-                summary["creators"].append(creator_result)
-                if args.fail_fast:
+        if args.fail_fast:
+            # Preserve immediate-stop semantics when explicitly requested.
+            for creator in creators:
+                try:
+                    creator_result = process_creator(config, creator, runner, logger, env, args)
+                except Exception as exc:
+                    logger.write(f"达人任务失败 {creator_key(creator)}: {exc}")
+                    creator_result = {
+                        "key": creator_key(creator), "status": "failed",
+                        "error": str(exc), "works": [],
+                    }
+                    summary["creators"].append(creator_result)
                     break
-            else:
-                summary["creators"].append(creator_result)
+                else:
+                    summary["creators"].append(creator_result)
+        else:
+            # Collection is a single serial producer. Transcript work is a separate
+            # single-consumer queue, so creator B collection can overlap creator A
+            # processing without mixing transcript batches between creators.
+            scheduled: list[tuple[dict[str, Any], Any | None, dict[str, Any] | None]] = []
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="creator-transcripts") as executor:
+                for creator in creators:
+                    collection_started = time.perf_counter()
+                    try:
+                        context = collect_creator_phase(config, creator, runner, logger, env, args)
+                    except Exception as exc:
+                        logger.write(f"达人采集阶段失败 {creator_key(creator)}: {exc}")
+                        failed_result = {
+                            "key": creator_key(creator), "status": "failed",
+                            "error": str(exc), "works": [],
+                            "phase_timings": {
+                                "collection_and_sync_seconds": round(
+                                    time.perf_counter() - collection_started, 3,
+                                ),
+                            },
+                        }
+                        scheduled.append((creator, None, failed_result))
+                    else:
+                        future = executor.submit(
+                            process_creator_phase_safely, config, context, runner, logger, env, args,
+                        )
+                        scheduled.append((creator, future, None))
+
+                for creator, future, immediate_result in scheduled:
+                    if immediate_result is not None:
+                        summary["creators"].append(immediate_result)
+                        continue
+                    try:
+                        creator_result = future.result()
+                    except Exception as exc:
+                        logger.write(f"达人文案处理失败 {creator_key(creator)}: {exc}")
+                        creator_result = {
+                            "key": creator_key(creator), "status": "failed",
+                            "error": str(exc), "works": [],
+                        }
+                    summary["creators"].append(creator_result)
 
         summary["finished_at"] = now_text()
         summary["wall_seconds"] = round(time.perf_counter() - wall_started, 3)
