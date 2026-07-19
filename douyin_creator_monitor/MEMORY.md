@@ -174,3 +174,5 @@ python douyin_creator_monitor\scripts\run_three_creator_backfill.py
 主流水线采用“双流水线 + 达人级批量收口”：目录映射与 ASR 并行，ASR 完成一条即按完成顺序进入单消费者执行 IMA/本地知识库等可即时交付环节；夸克在达人级用 manifest 批量上传，随后飞书最终结果按达人批量写回。永久错误熔断仅在当前达人、当前交付目标内生效，不跨达人继承；超时、429、5xx、DNS 等临时错误不熔断。最终结果仍按原作品顺序汇总，确保报告稳定和断点状态可追踪。
 
 飞书最终写回使用 Base `records/batch_update`，每批最多 200 条，不再在单个子进程中逐条 upsert。夸克逐作品、飞书逐批次原子保存带 `batch_id` 的 checkpoint，中断恢复时只接受当前批次结果。达人级 `phase_timings` 记录夸克和飞书真实批次墙钟耗时；作品级耗时按批次作品数分摊并保留原始 `batch_duration_seconds`，避免性能统计重复放大。
+
+真实运行确认：本机 `lark-cli 1.0.69` 的 `--data @file` 虽出现在帮助文本中，但批量请求会解析失败；批量 JSON 必须通过 stdin 配合 `--data -` 传入。Base 日期字段使用 Unix 毫秒时间戳，不能把 `YYYY-MM-DD HH:mm:ss` 字符串直接交给原生 `records/batch_update`，否则会返回 `DatetimeFieldConvFail (1254064)`。

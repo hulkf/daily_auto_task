@@ -25,7 +25,7 @@ class WorkStatusWriterTest(unittest.TestCase):
         self.assertEqual(
             WRITER.build_patch(args),
             {
-                "记录时间": "2026-07-18 12:34:56",
+                "记录时间": 1784349296000,
                 "ima状态": "已上传",
                 "夸克网盘状态": "已上传",
                 "本地知识库状态": "已写入",
@@ -60,9 +60,10 @@ class WorkStatusWriterTest(unittest.TestCase):
             outputs = []
             requests = []
 
-            def capture_batch(cli, command):
-                data_arg = command[command.index("--data") + 1]
-                requests.append(json.loads(Path(data_arg[1:]).read_text(encoding="utf-8")))
+            def capture_batch(cli, command, input_text=None):
+                self.assertEqual(command[command.index("--data") + 1], "-")
+                self.assertIsNotNone(input_text)
+                requests.append(json.loads(input_text))
                 return {"data": {"records": [{"record_id": "rec1"}, {"record_id": "rec2"}]}}
 
             with patch.object(WRITER, "resolve_lark_cli", return_value="lark"), patch.object(

@@ -50,7 +50,7 @@ def read_text_arg(value: str | None, file_value: str | None) -> str:
     return value or ""
 
 
-def run_lark(cli: str, args: list[str]) -> dict:
+def run_lark(cli: str, args: list[str], input_text: str | None = None) -> dict:
     result = subprocess.run(
         [cli, *args],
         check=False,
@@ -58,6 +58,7 @@ def run_lark(cli: str, args: list[str]) -> dict:
         text=True,
         encoding="utf-8",
         errors="replace",
+        input=input_text,
     )
     if result.returncode != 0:
         raise SystemExit(result.stderr.strip() or result.stdout.strip() or f"lark-cli exited {result.returncode}")

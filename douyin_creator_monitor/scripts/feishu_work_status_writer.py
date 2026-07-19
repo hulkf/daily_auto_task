@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -24,8 +23,18 @@ BEIJING_TZ = timezone(timedelta(hours=8))
 BATCH_SIZE = 200
 
 
+def feishu_datetime(value: str | int | float | None) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value or "").strip()
+    if text.isdigit():
+        return int(text)
+    moment = datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=BEIJING_TZ) if text else datetime.now(BEIJING_TZ)
+    return int(moment.timestamp() * 1000)
+
+
 def build_patch(args: argparse.Namespace) -> dict[str, Any]:
-    patch: dict[str, Any] = {"记录时间": args.record_time or datetime.now(BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S")}
+    patch: dict[str, Any] = {"记录时间": feishu_datetime(args.record_time)}
     if args.ima_status:
         patch["ima状态"] = args.ima_status
     if args.kuake_status:
@@ -90,17 +99,14 @@ def write_batch(
     as_identity: str, dry_run: bool,
 ) -> dict[str, Any]:
     body = {"records": [{"record_id": row["record_id"], "fields": row["fields"]} for row in rows]}
-    with tempfile.TemporaryDirectory(prefix="feishu-batch-") as directory:
-        body_path = Path(directory) / "request.json"
-        body_path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
-        command = [
-            "api", "POST",
-            f"/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}/records/batch_update",
-            "--data", f"@{body_path}", "--format", "json", "--as", as_identity,
-        ]
-        if dry_run:
-            command.append("--dry-run")
-        return run_lark(cli, command)
+    command = [
+        "api", "POST",
+        f"/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}/records/batch_update",
+        "--data", "-", "--format", "json", "--as", as_identity,
+    ]
+    if dry_run:
+        command.append("--dry-run")
+    return run_lark(cli, command, json.dumps(body, ensure_ascii=False))
 
 
 def main(argv: list[str] | None = None) -> int:
