@@ -60,6 +60,33 @@ def load_json(path: Path) -> dict[str, Any]:
         raise KuakeBackupError(f"配置文件不是合法 JSON: {path}") from exc
 
 
+def permanent_delivery_error(error: str) -> bool:
+    text = str(error or "").lower()
+    if any(value in text for value in (
+        "timeout", "timed out", "429", "500", "502", "503", "504", "dns",
+        "connection reset", "connection aborted", "temporarily unavailable", "网络超时", "连接中断", "临时",
+    )):
+        return False
+    return any(value in text for value in (
+        "credential", "cookie", "token invalid", "unauthorized", "forbidden", "permission denied",
+        "access denied", "not configured", "missing config", "凭证", "登录态", "未配置", "配置缺失", "权限",
+    ))
+
+
+def write_manifest_checkpoint(
+    path: Path | None, directory: str, results: dict[str, dict[str, Any]], batch_id: str = "",
+) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        json.dumps({"batch_id": batch_id, "directory": directory, "results": results}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
 def normalize_cookie(value: str) -> str:
     """Normalize cookies copied from chat/Markdown without printing them."""
     return value.strip().replace("\\_", "_").replace("*", "")
@@ -316,10 +343,19 @@ def cmd_upload_manifest(args: argparse.Namespace) -> int:
     remote_dir = args.remote_dir or str(payload.get("remote_dir") or "")
     if not remote_dir:
         remote_dir = join_remote_path(base_dir, sanitize_path_part(creator_name)) if creator_name else base_dir
+    result_file_value = str(payload.get("result_file") or "").strip()
+    result_file = Path(result_file_value) if result_file_value else None
+    batch_id = str(payload.get("batch_id") or "")
     directory = ensure_dir_details(args.kuake_exe, credentials, remote_dir)
     results: dict[str, dict[str, Any]] = {}
+    breaker = ""
     for item in items:
         work_id = str(item.get("aweme_id") or item.get("video_id") or "").strip()
+        result_key = work_id or f"item_{len(results) + 1}"
+        if breaker:
+            results[result_key] = {"status": "failed", "error": breaker}
+            write_manifest_checkpoint(result_file, directory.path, results, batch_id)
+            continue
         try:
             if not work_id:
                 raise KuakeBackupError("清单项缺少 aweme_id")
@@ -335,7 +371,11 @@ def cmd_upload_manifest(args: argparse.Namespace) -> int:
             )
             results[work_id] = {"status": "success", "remote_path": remote_path}
         except Exception as exc:
-            results[work_id or f"item_{len(results) + 1}"] = {"status": "failed", "error": str(exc)}
+            error = str(exc)
+            results[result_key] = {"status": "failed", "error": error}
+            if permanent_delivery_error(error):
+                breaker = error
+        write_manifest_checkpoint(result_file, directory.path, results, batch_id)
     print(json.dumps({"directory": directory.path, "results": results}, ensure_ascii=False))
     return 0
 

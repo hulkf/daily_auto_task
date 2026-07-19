@@ -36,6 +36,12 @@ class PipelineHelpersTest(unittest.TestCase):
         }
         self.assertTrue(PIPELINE.work_has_failed_stage(stages, feishu_only=True))
 
+    def test_feishu_only_status_fails_when_downstream_crashes_before_writeback(self):
+        self.assertTrue(PIPELINE.work_has_failed_stage({"downstream": "failed"}, feishu_only=True))
+
+    def test_ima_daily_quota_error_is_permanent_for_current_creator(self):
+        self.assertTrue(PIPELINE.permanent_delivery_error("HTTP 403 / code 200005 / 请求超量，请明日再试"))
+
     def test_permanent_delivery_error_opens_creator_target_circuit_breaker(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -91,10 +97,11 @@ class PipelineHelpersTest(unittest.TestCase):
             ]
             args = argparse.Namespace(dry_run=False, fail_fast=False)
 
-            PIPELINE.finalize_creator_batches(
-                {}, creator, selected, delivery_results, root / "state", runner,
-                PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
-            )
+            with patch.object(PIPELINE.time, "perf_counter", side_effect=[0.0, 4.0, 10.0, 16.0]):
+                timings = PIPELINE.finalize_creator_batches(
+                    {}, creator, selected, delivery_results, root / "state", runner,
+                    PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+                )
 
             self.assertEqual(runner.run.call_count, 2)
             self.assertIn("upload-manifest", runner.run.call_args_list[0].args[1])
@@ -102,6 +109,55 @@ class PipelineHelpersTest(unittest.TestCase):
             self.assertEqual(delivery_results["1"]["stages"]["backup_statuses_written_back"], "success")
             self.assertEqual(delivery_results["2"]["stages"]["backup_statuses_written_back"], "failed")
             self.assertNotIn("_batch", delivery_results["1"])
+            self.assertEqual(timings, {"kuake_batch_seconds": 4.0, "feishu_batch_seconds": 6.0})
+            states = [
+                json.loads((root / "state" / "a" / f"{work_id}.json").read_text(encoding="utf-8"))
+                for work_id in ("1", "2")
+            ]
+            self.assertEqual(sum(item["stages"]["kuake_backed_up"]["duration_seconds"] for item in states), 4.0)
+            self.assertEqual(sum(item["stages"]["feishu_written_back"]["duration_seconds"] for item in states), 6.0)
+            self.assertEqual(states[0]["stages"]["kuake_backed_up"]["batch_duration_seconds"], 4.0)
+
+    def test_quark_batch_recovers_completed_checkpoint_after_child_termination(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            creator = {"key": "a", "creator_name": "达人 A"}
+            selected = [{"aweme_id": "1", "create_time": 1}, {"aweme_id": "2", "create_time": 2}]
+            delivery_results = {}
+            for work in selected:
+                work_id = work["aweme_id"]
+                final_file = root / f"{work_id}.txt"
+                final_file.write_text("文案", encoding="utf-8")
+                delivery_results[work_id] = {
+                    "aweme_id": work_id,
+                    "stages": {"kuake_backed_up": "pending", "backup_statuses_written_back": "skipped"},
+                    "_batch": {
+                        "state_path": str(root / "state" / "a" / f"{work_id}.json"),
+                        "transcript_file": str(final_file),
+                    },
+                }
+
+            def terminate_after_checkpoint(label, command, env, **unused):
+                manifest_path = Path(command[command.index("--manifest") + 1])
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                result_path = Path(manifest["result_file"])
+                result_path.parent.mkdir(parents=True, exist_ok=True)
+                result_path.write_text(json.dumps({
+                    "batch_id": manifest["batch_id"],
+                    "results": {"1": {"status": "success", "remote_path": "/done/1.txt"}},
+                }, ensure_ascii=False), encoding="utf-8")
+                raise PIPELINE.PipelineError("child terminated")
+
+            runner = Mock()
+            runner.run.side_effect = terminate_after_checkpoint
+            PIPELINE.finalize_creator_batches(
+                {}, creator, selected, delivery_results, root / "state", runner,
+                PIPELINE.Logger(root / "log.txt", persist=False), {},
+                argparse.Namespace(dry_run=False, fail_fast=False),
+            )
+
+            self.assertEqual(delivery_results["1"]["stages"]["kuake_backed_up"], "success")
+            self.assertEqual(delivery_results["2"]["stages"]["kuake_backed_up"], "failed")
 
     def test_creator_mapping_confirmation_overlaps_asr_preparation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -336,7 +392,7 @@ class PipelineHelpersTest(unittest.TestCase):
                 "synced_record_ids": {},
                 "terminal": False,
             }
-            args = argparse.Namespace(asr_workers=1, fail_fast=False, dry_run=True)
+            args = argparse.Namespace(asr_workers=1, fail_fast=False, dry_run=False)
             prepared_ids: list[str] = []
             delivered_ids: list[str] = []
 
@@ -364,6 +420,9 @@ class PipelineHelpersTest(unittest.TestCase):
             self.assertIn("bad audio", result["works"][0]["error"])
             self.assertEqual(result["works"][1]["stages"]["transcribed"], "success")
             self.assertEqual(result["status"], "partial_failure")
+            persisted = json.loads((root / "state" / "a" / "1.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["stages"]["transcribed"]["status"], "failed")
+            self.assertEqual(persisted["stages"]["corrected"]["status"], "blocked")
 
     def test_creator_processing_records_unexpected_delivery_failure_and_continues_remaining_works(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -386,7 +445,7 @@ class PipelineHelpersTest(unittest.TestCase):
                 "synced_record_ids": {},
                 "terminal": False,
             }
-            args = argparse.Namespace(asr_workers=1, fail_fast=False, dry_run=True)
+            args = argparse.Namespace(asr_workers=1, fail_fast=False, dry_run=False)
             delivered_ids: list[str] = []
 
             def prepare(config, creator, work, works_file, profile_file, state_dir, media_dir, runner, logger, env, args):
@@ -414,6 +473,9 @@ class PipelineHelpersTest(unittest.TestCase):
             self.assertIn("writeback unavailable", result["works"][0]["error"])
             self.assertEqual(result["works"][1]["stages"]["transcribed"], "success")
             self.assertEqual(result["status"], "partial_failure")
+            persisted = json.loads((root / "state" / "a" / "1.json").read_text(encoding="utf-8"))
+            self.assertEqual(persisted["stages"]["downstream"]["status"], "failed")
+
     def test_select_works_filters_sorts_and_limits(self):
         works = [
             {"aweme_id": "old", "create_time": 1},

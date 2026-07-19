@@ -50,6 +50,34 @@ class KuakeBatchTest(unittest.TestCase):
         self.assertEqual(payload["results"]["1"]["status"], "success")
         self.assertEqual(payload["results"]["2"]["status"], "failed")
 
+    def test_manifest_stops_after_permanent_upload_error_and_checkpoints_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            files = []
+            for work_id in ("1", "2", "3"):
+                path = root / f"{work_id}.txt"
+                path.write_text(work_id, encoding="utf-8")
+                files.append({"aweme_id": work_id, "path": str(path), "video_date": "2026-07-19", "title": work_id})
+            result_file = root / "progress.json"
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({
+                "creator_name": "达人 A", "result_file": str(result_file), "files": files,
+            }, ensure_ascii=False), encoding="utf-8")
+            args = argparse.Namespace(
+                manifest=manifest, local_env=root / "env.json", base_dir="/备份",
+                creator_name="", remote_dir="", kuake_exe=root / "kuake.exe",
+            )
+            with patch.object(KUAKE, "load_credentials", return_value=(KUAKE.KuakeCredentials(cookie="x"), "/备份")), patch.object(
+                KUAKE, "ensure_dir_details", return_value=KUAKE.RemoteDirectory("达人 A", "/备份/达人 A"),
+            ), patch.object(KUAKE, "upload_file", side_effect=KUAKE.KuakeBackupError("Cookie 已失效")) as upload:
+                KUAKE.cmd_upload_manifest(args)
+
+            checkpoint = json.loads(result_file.read_text(encoding="utf-8"))
+            self.assertEqual(upload.call_count, 1)
+            self.assertEqual(checkpoint["results"]["1"]["status"], "failed")
+            self.assertEqual(checkpoint["results"]["2"]["status"], "failed")
+            self.assertIn("Cookie 已失效", checkpoint["results"]["3"]["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

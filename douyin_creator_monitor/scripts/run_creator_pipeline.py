@@ -430,10 +430,10 @@ def set_status(
 
 def set_combined_finalizer_status(
     state: dict[str, Any], *, transcript_included: bool, status: str,
-    duration_seconds: float, detail: str = "",
+    duration_seconds: float, detail: str = "", operation_id: str | None = None,
 ) -> None:
     """Record one remote operation once while keeping both logical stages resumable."""
-    operation_id = f"finalizer-{time.time_ns()}"
+    operation_id = operation_id or f"finalizer-{time.time_ns()}"
     if transcript_included:
         set_status(state, "feishu_written_back", status, detail, duration_seconds=duration_seconds)
         set_status(state, "backup_statuses_written_back", status, detail, duration_seconds=0.0)
@@ -441,6 +441,17 @@ def set_combined_finalizer_status(
         set_status(state, "backup_statuses_written_back", status, detail, duration_seconds=duration_seconds)
     for stage in (("feishu_written_back", "backup_statuses_written_back") if transcript_included else ("backup_statuses_written_back",)):
         state["stages"][stage]["operation_id"] = operation_id
+
+
+def persist_work_failure(
+    state_path: Path, creator: dict[str, Any], work: dict[str, Any],
+    stage: str, detail: str, *, blocked_stages: Iterable[str] = (),
+) -> None:
+    state = load_state(state_path, creator, work)
+    set_status(state, stage, "failed", detail)
+    for blocked_stage in blocked_stages:
+        set_status(state, blocked_stage, "blocked", detail)
+    write_json(state_path, state)
 
 
 def should_skip(
@@ -1066,6 +1077,7 @@ def permanent_delivery_error(error: str) -> bool:
     permanent = (
         "credential", "cookie", "token invalid", "unauthorized", "forbidden", "permission denied",
         "access denied", "not configured", "missing config", "knowledge base", "folder mapping",
+        "code 200005", "请求超量", "quota exceeded",
         "凭证", "登录态", "未配置", "配置缺失", "权限", "知识库不存在", "目录映射错误",
     )
     return any(marker in text for marker in permanent)
@@ -1535,10 +1547,25 @@ def parse_batch_results(output: str) -> dict[str, dict[str, Any]]:
     return values if isinstance(values, dict) else {}
 
 
+def read_batch_results(path: Path, expected_batch_id: str = "") -> dict[str, dict[str, Any]]:
+    if not path.is_file():
+        return {}
+    try:
+        payload = read_json(path)
+    except PipelineError:
+        return {}
+    if expected_batch_id and str(payload.get("batch_id") or "") != expected_batch_id:
+        return {}
+    values = payload.get("results") if isinstance(payload, dict) else None
+    return values if isinstance(values, dict) else {}
+
+
 def work_has_failed_stage(stages: dict[str, Any], *, feishu_only: bool = False) -> bool:
     if feishu_only:
+        if stages.get("downstream") == "failed":
+            return True
         return any(
-            stages.get(stage) == "failed"
+            stages.get(stage) not in {"success", "planned"}
             for stage in ("feishu_written_back", "backup_statuses_written_back")
         )
     return "failed" in stages.values()
@@ -1548,9 +1575,10 @@ def finalize_creator_batches(
     config: dict[str, Any], creator: dict[str, Any], selected: list[dict[str, Any]],
     delivery_results: dict[str, dict[str, Any]], state_dir: Path, runner: Runner,
     logger: Logger, env: dict[str, str], args: argparse.Namespace,
-) -> None:
+) -> dict[str, float]:
     batch_dir = state_dir / "batches" / creator_key(creator)
     work_by_id = {str(work["aweme_id"]): work for work in selected}
+    timings: dict[str, float] = {}
 
     kuake_ids = [
         work_id for work_id, item in delivery_results.items()
@@ -1558,6 +1586,7 @@ def finalize_creator_batches(
     ]
     if kuake_ids:
         manifest_path = batch_dir / "kuake-upload.json"
+        result_path = batch_dir / "kuake-upload-result.json"
         payload = {
             "creator_name": str(creator.get("creator_dir_name") or creator.get("creator_name") or ""),
             "files": [
@@ -1570,39 +1599,47 @@ def finalize_creator_batches(
                 for work_id in kuake_ids
             ],
         }
+        batch_id = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        payload["batch_id"] = batch_id
+        payload["result_file"] = str(result_path)
         if not args.dry_run:
             write_json(manifest_path, payload)
         batch_started = time.perf_counter()
+        batch_results: dict[str, dict[str, Any]] = {}
+        batch_error = ""
         try:
             output = runner.run(
                 f"夸克达人级批量上传 {creator_key(creator)} ({len(kuake_ids)}条)",
                 kuake_batch_command(config, creator, manifest_path), env,
             )
-            batch_results = parse_batch_results(output)
-            batch_seconds = time.perf_counter() - batch_started
-            for work_id in kuake_ids:
-                outcome = batch_results.get(work_id, {})
-                status = "planned" if args.dry_run else str(outcome.get("status") or "failed")
-                detail = str(outcome.get("error") or "")
-                delivery_results[work_id]["stages"]["kuake_backed_up"] = status
-                if not args.dry_run:
-                    state_path = Path(delivery_results[work_id]["_batch"]["state_path"])
-                    state = load_state(state_path, creator, work_by_id[work_id])
-                    set_status(state, "kuake_backed_up", status, detail, duration_seconds=batch_seconds)
-                    write_json(state_path, state)
+            batch_results = parse_batch_results(output) or read_batch_results(result_path, batch_id)
         except Exception as exc:
-            detail = str(exc)
-            batch_seconds = time.perf_counter() - batch_started
-            logger.write(f"夸克达人级批量上传失败: {detail}")
-            for work_id in kuake_ids:
-                delivery_results[work_id]["stages"]["kuake_backed_up"] = "failed"
-                if not args.dry_run:
-                    state_path = Path(delivery_results[work_id]["_batch"]["state_path"])
-                    state = load_state(state_path, creator, work_by_id[work_id])
-                    set_status(state, "kuake_backed_up", "failed", detail, duration_seconds=batch_seconds)
-                    write_json(state_path, state)
-            if args.fail_fast:
-                raise
+            batch_error = str(exc)
+            batch_results = read_batch_results(result_path, batch_id)
+            logger.write(f"夸克达人级批量上传失败: {batch_error}")
+        batch_seconds = time.perf_counter() - batch_started
+        timings["kuake_batch_seconds"] = round(batch_seconds, 3)
+        duration_share = batch_seconds / len(kuake_ids)
+        operation_id = f"kuake-batch-{time.time_ns()}"
+        for work_id in kuake_ids:
+            outcome = batch_results.get(work_id, {})
+            if args.dry_run:
+                status = "planned"
+            elif outcome.get("status") == "success":
+                status = "success"
+            else:
+                status = "failed"
+            detail = str(outcome.get("error") or batch_error or "批量上传未返回该作品结果")
+            delivery_results[work_id]["stages"]["kuake_backed_up"] = status
+            if not args.dry_run:
+                state_path = Path(delivery_results[work_id]["_batch"]["state_path"])
+                state = load_state(state_path, creator, work_by_id[work_id])
+                set_status(state, "kuake_backed_up", status, detail, duration_seconds=duration_share)
+                state["stages"]["kuake_backed_up"]["operation_id"] = operation_id
+                state["stages"]["kuake_backed_up"]["batch_duration_seconds"] = round(batch_seconds, 3)
+                write_json(state_path, state)
+        if batch_error and args.fail_fast:
+            raise PipelineError(batch_error)
 
     feishu_ids = [
         work_id for work_id, item in delivery_results.items()
@@ -1610,6 +1647,7 @@ def finalize_creator_batches(
     ]
     if feishu_ids:
         manifest_path = batch_dir / "feishu-final-writeback.json"
+        result_path = batch_dir / "feishu-final-writeback-result.json"
         payload = {
             "table_id": str(creator.get("works_table_id") or ""),
             "records": [
@@ -1624,56 +1662,58 @@ def finalize_creator_batches(
                 for work_id in feishu_ids
             ],
         }
+        batch_id = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        payload["batch_id"] = batch_id
+        payload["result_file"] = str(result_path)
         if not args.dry_run:
             write_json(manifest_path, payload)
         batch_started = time.perf_counter()
+        batch_results = {}
+        batch_error = ""
         try:
             output = runner.run(
                 f"飞书最终结果批量写回 {creator_key(creator)} ({len(feishu_ids)}条)",
                 status_writeback_batch_command(config, creator, manifest_path), env,
                 sensitive=("--table-id", "--base-token"),
             )
-            batch_results = parse_batch_results(output)
-            batch_seconds = time.perf_counter() - batch_started
-            for work_id in feishu_ids:
-                outcome = batch_results.get(work_id, {})
-                status = "planned" if args.dry_run else str(outcome.get("status") or "failed")
-                success = status in {"success", "planned"}
-                transcript_included = bool(delivery_results[work_id]["_batch"].get("transcript_file"))
-                delivery_results[work_id]["stages"]["backup_statuses_written_back"] = status
-                if transcript_included:
-                    delivery_results[work_id]["stages"]["feishu_written_back"] = status
-                if not args.dry_run:
-                    state_path = Path(delivery_results[work_id]["_batch"]["state_path"])
-                    state = load_state(state_path, creator, work_by_id[work_id])
-                    set_combined_finalizer_status(
-                        state, transcript_included=transcript_included,
-                        status="success" if success else "failed",
-                        duration_seconds=batch_seconds, detail=str(outcome.get("error") or ""),
-                    )
-                    write_json(state_path, state)
+            batch_results = parse_batch_results(output) or read_batch_results(result_path, batch_id)
         except Exception as exc:
-            detail = str(exc)
-            batch_seconds = time.perf_counter() - batch_started
-            logger.write(f"飞书最终结果批量写回失败: {detail}")
-            for work_id in feishu_ids:
-                transcript_included = bool(delivery_results[work_id]["_batch"].get("transcript_file"))
-                delivery_results[work_id]["stages"]["backup_statuses_written_back"] = "failed"
-                if transcript_included:
-                    delivery_results[work_id]["stages"]["feishu_written_back"] = "failed"
-                if not args.dry_run:
-                    state_path = Path(delivery_results[work_id]["_batch"]["state_path"])
-                    state = load_state(state_path, creator, work_by_id[work_id])
-                    set_combined_finalizer_status(
-                        state, transcript_included=transcript_included, status="failed",
-                        duration_seconds=batch_seconds, detail=detail,
-                    )
-                    write_json(state_path, state)
-            if args.fail_fast:
-                raise
+            batch_error = str(exc)
+            batch_results = read_batch_results(result_path, batch_id)
+            logger.write(f"飞书最终结果批量写回失败: {batch_error}")
+        batch_seconds = time.perf_counter() - batch_started
+        timings["feishu_batch_seconds"] = round(batch_seconds, 3)
+        duration_share = batch_seconds / len(feishu_ids)
+        operation_id = f"feishu-batch-{time.time_ns()}"
+        for work_id in feishu_ids:
+            outcome = batch_results.get(work_id, {})
+            if args.dry_run:
+                status = "planned"
+            elif outcome.get("status") == "success":
+                status = "success"
+            else:
+                status = "failed"
+            detail = str(outcome.get("error") or batch_error or "批量写回未返回该作品结果")
+            transcript_included = bool(delivery_results[work_id]["_batch"].get("transcript_file"))
+            delivery_results[work_id]["stages"]["backup_statuses_written_back"] = status
+            if transcript_included:
+                delivery_results[work_id]["stages"]["feishu_written_back"] = status
+            if not args.dry_run:
+                state_path = Path(delivery_results[work_id]["_batch"]["state_path"])
+                state = load_state(state_path, creator, work_by_id[work_id])
+                set_combined_finalizer_status(
+                    state, transcript_included=transcript_included, status=status,
+                    duration_seconds=duration_share, detail=detail, operation_id=operation_id,
+                )
+                target_stage = "feishu_written_back" if transcript_included else "backup_statuses_written_back"
+                state["stages"][target_stage]["batch_duration_seconds"] = round(batch_seconds, 3)
+                write_json(state_path, state)
+        if batch_error and args.fail_fast:
+            raise PipelineError(batch_error)
 
     for item in delivery_results.values():
         item.pop("_batch", None)
+    return timings
 
 
 def process_creator_phase(
@@ -1707,11 +1747,18 @@ def process_creator_phase(
 
     def failed_preparation(work_id: str, exc: Exception) -> dict[str, Any]:
         logger.write(f"作品预处理异常 {work_id}: {exc}")
+        detail = str(exc)
+        if not args.dry_run:
+            state_path = state_dir / creator_key(creator) / f"{safe_key(work_id)}.json"
+            persist_work_failure(
+                state_path, creator, work_by_id[work_id], "transcribed", detail,
+                blocked_stages=("corrected",),
+            )
         return {
             "aweme_id": work_id,
             "title": title_of(work_by_id[work_id]),
             "stages": {"transcribed": "failed", "corrected": "blocked"},
-            "error": str(exc),
+            "error": detail,
         }
 
     def sync_mappings_timed() -> tuple[dict[str, str] | None, float, Exception | None]:
@@ -1758,6 +1805,11 @@ def process_creator_phase(
                 work_result["stages"] = dict(work_result.get("stages", {}))
                 work_result["stages"]["downstream"] = "failed"
                 work_result["error"] = str(exc)
+                if not args.dry_run:
+                    state_path = state_dir / creator_key(creator) / f"{safe_key(work_id)}.json"
+                    persist_work_failure(
+                        state_path, creator, work, "downstream", str(exc),
+                    )
             delivery_results[work_id] = work_result
             if getattr(args, "fail_fast", False) and "failed" in work_result["stages"].values():
                 raise PipelineError(f"Work {work_result['aweme_id']} has a failed stage.")
@@ -1799,9 +1851,10 @@ def process_creator_phase(
                         raise
         wait_for_mappings()
 
-    finalize_creator_batches(
+    batch_timings = finalize_creator_batches(
         config, creator, selected, delivery_results, state_dir, runner, logger, env, args,
     )
+    result.setdefault("phase_timings", {}).update(batch_timings)
     result["works"] = [delivery_results[str(work["aweme_id"])] for work in selected]
     failed_work = any(
         work_has_failed_stage(item["stages"], feishu_only=getattr(args, "feishu_only", False))

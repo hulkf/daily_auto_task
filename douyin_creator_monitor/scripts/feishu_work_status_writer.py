@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Write final backup statuses and last-update time to a Feishu work row."""
+"""Write final transcripts and backup statuses to Feishu Base."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -14,11 +15,13 @@ from feishu_transcript_writer import (
     load_base_token,
     redact_value,
     resolve_lark_cli,
+    run_lark,
     write_transcript,
 )
 
 
 BEIJING_TZ = timezone(timedelta(hours=8))
+BATCH_SIZE = 200
 
 
 def build_patch(args: argparse.Namespace) -> dict[str, Any]:
@@ -49,9 +52,7 @@ def item_namespace(args: argparse.Namespace, item: dict[str, Any]) -> argparse.N
     return argparse.Namespace(**values)
 
 
-def write_one(
-    cli: str, base_token: str, args: argparse.Namespace,
-) -> tuple[str, dict[str, Any]]:
+def write_one(cli: str, base_token: str, args: argparse.Namespace) -> tuple[str, dict[str, Any]]:
     if not args.table_id or not args.work_id:
         raise ValueError("table_id 和 work_id 不能为空")
     record_id = args.record_id or find_record_by_work_id(
@@ -61,6 +62,45 @@ def write_one(
         cli, base_token, args.table_id, record_id, build_patch(args), args.as_identity, args.dry_run,
     )
     return record_id, redact_value(response, base_token)
+
+
+def permanent_delivery_error(error: str) -> bool:
+    text = str(error or "").lower()
+    if any(value in text for value in ("timeout", "timed out", "429", "500", "502", "503", "504", "dns", "temporarily unavailable")):
+        return False
+    return any(value in text for value in (
+        "credential", "cookie", "token invalid", "unauthorized", "forbidden", "permission denied",
+        "access denied", "missing config", "not configured", "91403", "凭证", "登录态", "权限", "未配置", "配置缺失",
+    ))
+
+
+def write_checkpoint(
+    path: Path | None, results: dict[str, dict[str, Any]], batch_id: str = "",
+) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps({"batch_id": batch_id, "results": results}, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
+
+
+def write_batch(
+    cli: str, base_token: str, table_id: str, rows: list[dict[str, Any]],
+    as_identity: str, dry_run: bool,
+) -> dict[str, Any]:
+    body = {"records": [{"record_id": row["record_id"], "fields": row["fields"]} for row in rows]}
+    with tempfile.TemporaryDirectory(prefix="feishu-batch-") as directory:
+        body_path = Path(directory) / "request.json"
+        body_path.write_text(json.dumps(body, ensure_ascii=False), encoding="utf-8")
+        command = [
+            "api", "POST",
+            f"/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}/records/batch_update",
+            "--data", f"@{body_path}", "--format", "json", "--as", as_identity,
+        ]
+        if dry_run:
+            command.append("--dry-run")
+        return run_lark(cli, command)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -91,15 +131,56 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("批量写回清单缺少非空 records 数组")
         if not args.table_id:
             args.table_id = str(payload.get("table_id") or "")
+        if not args.table_id:
+            parser.error("批量写回缺少 table_id")
+        result_file_value = str(payload.get("result_file") or "").strip()
+        result_file = Path(result_file_value) if result_file_value else None
+        batch_id = str(payload.get("batch_id") or "")
         results: dict[str, dict[str, Any]] = {}
+        pending: list[dict[str, Any]] = []
+        breaker = ""
         for item in items:
             work_id = str(item.get("work_id") or item.get("aweme_id") or "").strip()
+            result_key = work_id or f"item_{len(results) + 1}"
+            if breaker:
+                results[result_key] = {"status": "failed", "error": breaker}
+                write_checkpoint(result_file, results, batch_id)
+                continue
             try:
                 current = item_namespace(args, {**item, "work_id": work_id})
-                record_id, response = write_one(cli, base_token, current)
-                results[work_id] = {"status": "success", "record_id": record_id, "response": response}
+                if not work_id:
+                    raise ValueError("清单项缺少 work_id")
+                record_id = current.record_id or find_record_by_work_id(
+                    cli, base_token, current.table_id, current.work_id, current.work_id_field, current.as_identity,
+                )
+                pending.append({"work_id": work_id, "record_id": record_id, "fields": build_patch(current)})
             except (Exception, SystemExit) as exc:
-                results[work_id or f"item_{len(results) + 1}"] = {"status": "failed", "error": str(exc)}
+                error = str(exc).replace(base_token, "<BASE_TOKEN>")
+                results[result_key] = {"status": "failed", "error": error}
+                if permanent_delivery_error(error):
+                    breaker = error
+                write_checkpoint(result_file, results, batch_id)
+
+        for offset in range(0, len(pending), BATCH_SIZE):
+            chunk = pending[offset:offset + BATCH_SIZE]
+            if breaker:
+                for row in chunk:
+                    results[row["work_id"]] = {"status": "failed", "error": breaker}
+                write_checkpoint(result_file, results, batch_id)
+                continue
+            try:
+                response = redact_value(write_batch(
+                    cli, base_token, args.table_id, chunk, args.as_identity, args.dry_run,
+                ), base_token)
+                for row in chunk:
+                    results[row["work_id"]] = {"status": "success", "record_id": row["record_id"], "response": response}
+            except (Exception, SystemExit) as exc:
+                error = str(exc).replace(base_token, "<BASE_TOKEN>")
+                for row in chunk:
+                    results[row["work_id"]] = {"status": "failed", "record_id": row["record_id"], "error": error}
+                if permanent_delivery_error(error):
+                    breaker = error
+            write_checkpoint(result_file, results, batch_id)
         print(json.dumps({"results": results}, ensure_ascii=False))
         return 0
 

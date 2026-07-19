@@ -44,7 +44,7 @@ class WorkStatusWriterTest(unittest.TestCase):
             patch_value = WRITER.build_patch(args)
         self.assertEqual(patch_value["语音转写全文"], "最终文案")
 
-    def test_manifest_writeback_reports_partial_success(self):
+    def test_manifest_writeback_uses_one_heterogeneous_batch_api_call(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             transcript = root / "final.txt"
@@ -58,18 +58,53 @@ class WorkStatusWriterTest(unittest.TestCase):
                 ],
             }, ensure_ascii=False), encoding="utf-8")
             outputs = []
+            requests = []
+
+            def capture_batch(cli, command):
+                data_arg = command[command.index("--data") + 1]
+                requests.append(json.loads(Path(data_arg[1:]).read_text(encoding="utf-8")))
+                return {"data": {"records": [{"record_id": "rec1"}, {"record_id": "rec2"}]}}
+
             with patch.object(WRITER, "resolve_lark_cli", return_value="lark"), patch.object(
                 WRITER, "load_base_token", return_value="token",
-            ), patch.object(WRITER, "write_transcript", side_effect=[{"ok": True}, RuntimeError("row locked")]), patch(
+            ), patch.object(WRITER, "run_lark", side_effect=capture_batch), patch(
                 "builtins.print", side_effect=lambda value: outputs.append(str(value)),
             ):
                 exit_code = WRITER.main(["--manifest", str(manifest)])
 
         payload = json.loads(outputs[-1])
         self.assertEqual(exit_code, 0)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual([item["record_id"] for item in requests[0]["records"]], ["rec1", "rec2"])
+        self.assertEqual(requests[0]["records"][0]["fields"]["语音转写全文"], "最终文案")
         self.assertEqual(payload["results"]["1"]["status"], "success")
-        self.assertEqual(payload["results"]["2"]["status"], "failed")
+        self.assertEqual(payload["results"]["2"]["status"], "success")
 
+    def test_manifest_stops_remaining_batches_after_permanent_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            transcript = root / "final.txt"
+            transcript.write_text("最终文案", encoding="utf-8")
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({
+                "table_id": "tbl1",
+                "records": [
+                    {"work_id": "1", "record_id": "rec1", "transcript_file": str(transcript)},
+                    {"work_id": "2", "record_id": "rec2", "transcript_file": str(transcript)},
+                ],
+            }, ensure_ascii=False), encoding="utf-8")
+            outputs = []
+            with patch.object(WRITER, "BATCH_SIZE", 1), patch.object(
+                WRITER, "resolve_lark_cli", return_value="lark",
+            ), patch.object(WRITER, "load_base_token", return_value="token"), patch.object(
+                WRITER, "run_lark", side_effect=SystemExit("91403 permission denied"),
+            ) as run_lark, patch("builtins.print", side_effect=lambda value: outputs.append(str(value))):
+                WRITER.main(["--manifest", str(manifest)])
+
+        payload = json.loads(outputs[-1])
+        self.assertEqual(run_lark.call_count, 1)
+        self.assertEqual(payload["results"]["1"]["status"], "failed")
+        self.assertEqual(payload["results"]["2"]["status"], "failed")
 
 
 if __name__ == "__main__":
