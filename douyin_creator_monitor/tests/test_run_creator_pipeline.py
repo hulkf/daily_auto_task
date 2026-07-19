@@ -48,6 +48,13 @@ class PipelineHelpersTest(unittest.TestCase):
     def test_audio_url_prefers_normalized_then_raw(self):
         self.assertEqual(PIPELINE.audio_url({"music_download_url": "direct", "raw": {"music_download_url": "raw"}}), "direct")
         self.assertEqual(PIPELINE.audio_url({"raw": {"music_download_url": ["raw-list"]}}), "raw-list")
+        self.assertEqual(PIPELINE.audio_url({"raw": {"video_download_url": "video"}}), "video")
+
+    def test_fallback_work_text_prefers_raw_metadata(self):
+        self.assertEqual(
+            PIPELINE.fallback_work_text({"desc": "发布文案", "raw": {"title": "标题"}}),
+            "标题",
+        )
 
     def test_sensitive_command_values_are_masked(self):
         command = ["python", "script.py", "--audio-url", "signed-url", "--table-id", "tbl-secret"]
@@ -305,6 +312,90 @@ class PipelineHelpersTest(unittest.TestCase):
             True,
         )
         self.assertIn("--force-full-collect", forced)
+
+
+    def test_backfill_selection_advances_after_local_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_dir = root / "state"
+            media_dir = root / "media"
+            creator = {"key": "demo", "creator_name": "示例"}
+            config = {
+                "asr": {"provider": "volcengine"},
+                "ima": {"enabled": True},
+                "kuake": {"enabled": True},
+                "obsidian": {"enabled": True},
+            }
+            args = argparse.Namespace(skip_ima=False, skip_kuake=False, skip_obsidian=False)
+            works = [
+                {"aweme_id": "new", "create_time": 2},
+                {"aweme_id": "old", "create_time": 1},
+            ]
+            for work in works:
+                paths = PIPELINE.artifact_paths(media_dir, work["aweme_id"], "volcengine")
+                paths["final"].parent.mkdir(parents=True, exist_ok=True)
+                paths["final"].write_text("文案", encoding="utf-8")
+                state = PIPELINE.load_state(
+                    state_dir / "demo" / f"{work['aweme_id']}.json", creator, work,
+                )
+                for stage in ("ima_backed_up", "kuake_backed_up", "obsidian_exported"):
+                    PIPELINE.set_status(state, stage, "success")
+                PIPELINE.write_json(state_dir / "demo" / f"{work['aweme_id']}.json", state)
+            (media_dir / "new.final.txt").unlink()
+
+            selected = PIPELINE.select_backfill_works(
+                config, creator, works, state_dir, media_dir, args, 1,
+            )
+            self.assertEqual([item["aweme_id"] for item in selected], ["new"])
+
+    def test_prepare_work_seeds_text_only_aweme_without_external_asr(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            work = {"aweme_id": "note-1", "create_time": 1, "desc": "图文作品发布文案"}
+            creator = {"key": "demo", "creator_name": "示例"}
+            args = argparse.Namespace(
+                dry_run=False, skip_transcribe=False, skip_correction=True, resume=True,
+                force_stage=set(),
+            )
+            runner = Mock()
+            result = PIPELINE.prepare_work(
+                {"asr": {"provider": "volcengine"}}, creator, work, root / "works.json",
+                None, root / "state", root / "media", runner,
+                PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+            )
+            runner.run.assert_not_called()
+            paths = PIPELINE.artifact_paths(root / "media", "note-1", "volcengine")
+            self.assertEqual(paths["raw_text"].read_text(encoding="utf-8"), "图文作品发布文案")
+            self.assertEqual(result["stages"]["transcribed"], "skipped")
+
+    def test_skip_feishu_writeback_never_runs_finalizer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_dir = root / "media"
+            state_dir = root / "state"
+            work = {"aweme_id": "123", "create_time": 1}
+            creator = {"key": "demo", "creator_name": "示例"}
+            paths = PIPELINE.artifact_paths(media_dir, "123", "volcengine")
+            paths["final"].parent.mkdir(parents=True, exist_ok=True)
+            paths["final"].write_text("最终文案", encoding="utf-8")
+            args = argparse.Namespace(
+                dry_run=False, skip_feishu_writeback=True, skip_ima=True, skip_kuake=True,
+                skip_obsidian=True, resume=True, force_stage=set(), fail_fast=False,
+                overwrite=False, backup_workers=1,
+            )
+            runner = Mock()
+            result = PIPELINE.process_downstream(
+                {"asr": {"provider": "volcengine"}}, creator, work, root / "works.json",
+                None, state_dir, media_dir, runner, PIPELINE.Logger(root / "log.txt", persist=False),
+                {}, args, {"aweme_id": "123", "title": "标题", "stages": {"corrected": "success"}},
+            )
+            runner.run.assert_not_called()
+            self.assertEqual(result["stages"]["feishu_written_back"], "disabled")
+            self.assertEqual(result["stages"]["backup_statuses_written_back"], "disabled")
+
+    def test_parser_accepts_backfill_existing(self):
+        args = PIPELINE.build_parser().parse_args(["--backfill-existing"])
+        self.assertTrue(args.backfill_existing)
 
 
 if __name__ == "__main__":

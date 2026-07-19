@@ -224,3 +224,18 @@ D:\JR_project\daily_auto_task\douyin_creator_monitor
 ~~~
 
 建议先手动运行单条作品并确认飞书、IMA、夸克和 Obsidian 均正确，再接入每日调度。
+
+
+## 历史作品补录与仅新增作品
+
+日常运行默认使用增量采集：首次建立完整历史基线后，后续至少检查最新 3 条，遇到已知作品边界即停止，只把新增作品加入待处理队列。
+
+如果本地作品文件已经存在，但历史作品尚未生成最终文案或尚未完成已启用的 IMA、夸克、Obsidian 备份，使用可断点续跑的历史补录模式：
+
+~~~powershell
+python .\scripts\run_creator_pipeline.py --creator aligc --skip-collect --backfill-existing --max-works 20 --skip-feishu-sync --skip-feishu-writeback
+~~~
+
+--backfill-existing 每轮只选择缺少非空 runtime/media/<作品ID>.final.txt 或缺少已启用备份成功状态的作品；成功作品下一轮会自动退出选择范围，因此 --max-works 可以安全分批，不会永远重复选择最新一批。完全跳过飞书时，达人目录确认、ASR、纠正和三处备份仍照常执行，且不会调用飞书目录映射或状态回写命令。
+
+视频没有独立音乐地址时会尝试作品视频地址；图文作品或确实没有可转写音轨的作品会使用作品发布文案生成原始文本，再继续纠正和备份，保证每条作品都有对应的最终文案文件。

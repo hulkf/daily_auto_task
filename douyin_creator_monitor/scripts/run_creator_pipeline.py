@@ -217,12 +217,22 @@ def raw_work(work: dict[str, Any]) -> dict[str, Any]:
 
 
 def audio_url(work: dict[str, Any]) -> str:
-    for value in (work.get("music_download_url"), raw_work(work).get("music_download_url")):
+    raw = raw_work(work)
+    for value in (
+        work.get("music_download_url"), raw.get("music_download_url"),
+        work.get("video_download_url"), raw.get("video_download_url"),
+    ):
         if isinstance(value, list):
             value = next((item for item in value if isinstance(item, str) and item.strip()), "")
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def fallback_work_text(work: dict[str, Any]) -> str:
+    raw = raw_work(work)
+    value = str(raw.get("desc") or raw.get("title") or work.get("desc") or work.get("title") or "")
+    return value.strip()
 
 
 def title_of(work: dict[str, Any]) -> str:
@@ -264,6 +274,53 @@ def select_works(works: list[dict[str, Any]], ids: set[str], maximum: int) -> li
         if missing:
             raise PipelineError(f"作品文件中找不到指定作品 ID: {sorted(missing)}")
     selected.sort(key=lambda w: int(w.get("create_time") or 0), reverse=True)
+    return selected[:maximum] if maximum > 0 else selected
+
+
+def backfill_stage_requirements(config: dict[str, Any], args: argparse.Namespace) -> tuple[str, ...]:
+    """Return the local stages that must be complete for historical backfill."""
+
+    required = ["corrected"]
+    for section_name, option_name, stage in (
+        ("ima", "skip_ima", "ima_backed_up"),
+        ("kuake", "skip_kuake", "kuake_backed_up"),
+        ("obsidian", "skip_obsidian", "obsidian_exported"),
+    ):
+        if not getattr(args, option_name, False) and bool(section(config, section_name).get("enabled", True)):
+            required.append(stage)
+    return tuple(required)
+
+
+def work_needs_backfill(
+    config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any],
+    state_dir: Path, media_dir: Path, args: argparse.Namespace,
+) -> bool:
+    """Check whether a local work still lacks its final transcript or an enabled backup."""
+
+    work_id = str(work["aweme_id"])
+    state_path = state_dir / creator_key(creator) / f"{safe_key(work_id)}.json"
+    state = load_state(state_path, creator, work)
+    provider = str(chosen(creator, section(config, "asr"), "provider", "volcengine"))
+    paths = artifact_paths(media_dir, work_id, provider)
+    if not nonempty(paths["final"]):
+        return True
+    for stage in backfill_stage_requirements(config, args):
+        if stage == "corrected":
+            continue
+        if status_of(state, stage) != "success":
+            return True
+    return False
+
+
+def select_backfill_works(
+    config: dict[str, Any], creator: dict[str, Any], works: list[dict[str, Any]],
+    state_dir: Path, media_dir: Path, args: argparse.Namespace, maximum: int,
+) -> list[dict[str, Any]]:
+    selected = [
+        work for work in works
+        if work_needs_backfill(config, creator, work, state_dir, media_dir, args)
+    ]
+    selected.sort(key=lambda work: int(work.get("create_time") or 0), reverse=True)
     return selected[:maximum] if maximum > 0 else selected
 
 
@@ -784,7 +841,16 @@ def sync_creator_backup_mappings(
         else:
             outcomes[key] = str(item.get("status") or "success")
             ready_metadata.append(metadata)
-    if ready_metadata:
+    if ready_metadata and args.skip_feishu_writeback:
+        logger.write("跳过飞书达人目录映射回写；本地目录确认结果继续有效")
+        if not args.dry_run:
+            write_json(marker_path, {
+                "creator_key": creator_key(creator),
+                "signature": mapping_cache_signature(ready_metadata),
+                "confirmed_at": now_text(),
+                "feishu_writeback": "disabled",
+            })
+    elif ready_metadata:
         try:
             output = runner.run(
                 "合并回写达人目录映射到飞书",
@@ -953,6 +1019,18 @@ def prepare_work(
     logger.write(f"处理作品 {work_id}: {title_of(work)}")
     result: dict[str, Any] = {"aweme_id": work_id, "title": title_of(work), "stages": {}}
     source_url = audio_url(work)
+    fallback_text = fallback_work_text(work)
+    if not args.dry_run and not source_url and not nonempty(paths["raw_text"]) and fallback_text:
+        paths["raw_text"].parent.mkdir(parents=True, exist_ok=True)
+        paths["raw_text"].write_text(fallback_text, encoding="utf-8")
+        paths["raw_json"].write_text(json.dumps({
+            "strategy": "work-text-fallback",
+            "aweme_id": work_id,
+            "text": fallback_text,
+        }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        set_status(state, "transcribed", "success", "作品无可用音轨，使用发布文案", True)
+        write_json(state_path, state)
+        logger.write(f"作品 {work_id} 无可用音轨，使用发布文案作为原始文案")
 
     if args.skip_transcribe:
         result["stages"]["transcribed"] = "disabled"
@@ -1073,6 +1151,9 @@ def process_downstream(
         write_json(state_path, state)
     if args.fail_fast and any(item.get("status") == "failed" for item in outcomes.values()):
         raise PipelineError(f"作品 {work_id} 存在备份失败阶段。")
+    if args.skip_feishu_writeback:
+        result["stages"]["backup_statuses_written_back"] = "disabled"
+        return result
     if not finalizer_needed(
         result["stages"], transcript_file,
         status_of(state, "backup_statuses_written_back"), args.resume,
@@ -1197,6 +1278,13 @@ def process_creator(
     pending_selection = False
     if requested_ids:
         selected = select_works(all_works, requested_ids, maximum)
+    elif args.backfill_existing:
+        selected = select_backfill_works(
+            config, creator, all_works, state_dir, media_dir, args, maximum,
+        )
+        result["backfill_remaining_before_run"] = len(select_backfill_works(
+            config, creator, all_works, state_dir, media_dir, args, 0,
+        ))
     elif collection_attempted:
         pending_selection = True
         pending_ids = pending_collection_ids(collection_state_file, works_file)
@@ -1207,10 +1295,11 @@ def process_creator(
     result["selected_count"] = len(selected)
     logger.write(f"{name} 本轮选择 {len(selected)} / {len(all_works)} 条作品")
 
-    if pending_selection and not selected:
+    if not selected:
         result["backup_mappings"] = {}
         result["status"] = "success" if collection_ok else "partial_failure"
-        logger.write(f"{name} 没有待处理的新作品，跳过飞书、ASR 和备份阶段")
+        reason = "没有待处理的新作品" if pending_selection else "没有待补录的历史作品"
+        logger.write(f"{name} {reason}，跳过飞书、ASR 和备份阶段")
         logger.write(f"========== 达人结束: {name}，状态 {result['status']} ==========")
         return result
 
@@ -1342,6 +1431,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-collect", action="store_true")
     parser.add_argument("--normalize-only", action="store_true", help="采集阶段只规范化已有 MediaCrawler 输出")
     parser.add_argument("--force-full-collect", action="store_true", help="忽略全量基线标记，强制重新抓取全部历史作品")
+    parser.add_argument(
+        "--backfill-existing", action="store_true",
+        help="只选择缺少最终文案或尚未完成已启用备份的本地历史作品；支持 --max-works 分批续跑",
+    )
     parser.add_argument("--skip-feishu-sync", action="store_true")
     parser.add_argument("--skip-transcribe", action="store_true")
     parser.add_argument("--skip-correction", action="store_true")
