@@ -33,6 +33,7 @@ RUNTIME_DIR = PROJECT_DIR / "runtime"
 DEFAULT_OUTPUT_FILE = PROJECT_DIR / "runtime" / "zhiliao-works-from-mediacrawler.json"
 DEFAULT_MEDIA_OUTPUT_DIR = PROJECT_DIR / "runtime" / "mediacrawler-output"
 BEIJING_TZ = timezone(timedelta(hours=8))
+COLLECTION_STATE_VERSION = 1
 FIELD_ALIASES: dict[str, tuple[str, ...]] = {
     "aweme_id": ("aweme_id", "awemeId", "note_id", "id", "作品ID", "抖音作品ID"),
     "desc": ("desc", "title", "display_title", "content", "原始文案", "作品标题"),
@@ -321,7 +322,135 @@ def safe_source_path(path: Path) -> str:
         return path.name
 
 
-def build_payload(works: list[dict[str, Any]], creator_url: str, used_files: list[Path]) -> dict[str, Any]:
+def read_existing_payload(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"Cannot read existing normalized works file {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"Existing normalized works file must contain a JSON object: {path}")
+    return payload
+
+
+def works_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    works = payload.get("works", [])
+    if not isinstance(works, list):
+        return []
+    return [item for item in works if isinstance(item, dict) and item.get("aweme_id")]
+
+
+def merge_works(existing: Iterable[dict[str, Any]], current: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge refreshed works without erasing useful fields missing from this run."""
+
+    by_id: dict[str, dict[str, Any]] = {
+        str(item["aweme_id"]): dict(item) for item in existing if item.get("aweme_id")
+    }
+    for item in current:
+        work_id = str(item.get("aweme_id") or "")
+        if not work_id:
+            continue
+        merged = dict(by_id.get(work_id, {}))
+        for key, value in item.items():
+            if value is not None and value != "":
+                merged[key] = value
+        merged["aweme_id"] = work_id
+        by_id[work_id] = merged
+    return sorted(by_id.values(), key=lambda item: int(item.get("create_time") or 0), reverse=True)
+
+
+def select_incremental_page(
+    items: Iterable[dict[str, Any]], known_ids: set[str], checked_count: int,
+    probe_count: int, boundary_seen: bool = False,
+) -> tuple[list[dict[str, Any]], int, bool, str | None]:
+    """Choose the newest page prefix and stop after probing enough rows past a known boundary."""
+
+    selected: list[dict[str, Any]] = []
+    boundary_id: str | None = None
+    ordered = sorted(items, key=lambda item: int(item.get("create_time") or 0), reverse=True)
+    for item in ordered:
+        work_id = str(item.get("aweme_id") or "")
+        if not work_id:
+            continue
+        selected.append(item)
+        checked_count += 1
+        if work_id in known_ids:
+            boundary_seen = True
+            boundary_id = boundary_id or work_id
+        if boundary_seen and checked_count >= max(1, probe_count):
+            return selected, checked_count, True, boundary_id
+    return selected, checked_count, False, boundary_id
+
+
+def read_collection_state(path: Path | None) -> dict[str, Any]:
+    if path is None or not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def determine_collection_mode(
+    state: dict[str, Any], creator_id: str, existing_works: list[dict[str, Any]], force_full: bool,
+) -> str:
+    if force_full:
+        return "full"
+    if (
+        existing_works
+        and state.get("full_history_collected") is True
+        and str(state.get("creator_id") or "") == creator_id
+    ):
+        return "incremental"
+    return "full"
+
+
+def ordered_ids(ids: Iterable[str], works: list[dict[str, Any]]) -> list[str]:
+    wanted = {str(item) for item in ids if str(item)}
+    return [str(work["aweme_id"]) for work in works if str(work.get("aweme_id")) in wanted]
+
+
+def write_collection_state(
+    path: Path | None, *, creator_id: str, full_history_collected: bool,
+    mode: str, works: list[dict[str, Any]], pending_ids: list[str], report: dict[str, Any],
+    full_history_collected_at: str | None = None,
+) -> dict[str, Any]:
+    state = read_collection_state(path)
+    if state.get("creator_id") and str(state.get("creator_id")) != creator_id:
+        state = {}
+    captured_at = now_beijing()
+    state.update(
+        {
+            "version": COLLECTION_STATE_VERSION,
+            "creator_id": creator_id,
+            "full_history_collected": bool(full_history_collected),
+            "last_successful_collection_at": captured_at,
+            "last_collection_mode": mode,
+            "known_work_count": len(works),
+            "latest_aweme_ids": [str(item["aweme_id"]) for item in works[:20]],
+            "pending_aweme_ids": ordered_ids(pending_ids, works),
+            "last_report": report,
+        }
+    )
+    if full_history_collected:
+        state["full_history_collected_at"] = (
+            full_history_collected_at
+            or str(state.get("full_history_collected_at") or "")
+            or captured_at
+        )
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    return state
+
+
+def build_payload(
+    works: list[dict[str, Any]], creator_url: str, used_files: list[Path], *,
+    mode: str, full_history_collected: bool, new_ids: list[str],
+    pending_ids: list[str], report: dict[str, Any],
+) -> dict[str, Any]:
     return {
         "source": "MediaCrawler",
         "creator_url": creator_url,
@@ -330,6 +459,13 @@ def build_payload(works: list[dict[str, Any]], creator_url: str, used_files: lis
         "count": len(works),
         "works": works,
         "media_crawler_files": [safe_source_path(path) for path in used_files],
+        "collection_mode": mode,
+        "full_history_collected": bool(full_history_collected),
+        "new_count": len(new_ids),
+        "new_aweme_ids": new_ids,
+        "pending_count": len(pending_ids),
+        "pending_aweme_ids": pending_ids,
+        "collection_report": report,
     }
 
 
@@ -338,28 +474,103 @@ def write_payload(payload: dict[str, Any], output_file: Path) -> None:
     output_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def run_mediacrawler(args: argparse.Namespace) -> None:
+def run_mediacrawler(
+    args: argparse.Namespace, *, mode: str, known_ids: set[str],
+) -> tuple[Path, dict[str, Any]]:
     media_dir = resolve_media_crawler_dir(args.media_crawler_dir)
 
-    output_dir = Path(args.media_output_dir).expanduser().resolve()
-    if args.clean_media_output and output_dir.exists():
-        resolved_output = output_dir.resolve()
+    output_root = Path(args.media_output_dir).expanduser().resolve()
+    if args.clean_media_output and output_root.exists():
         resolved_runtime = RUNTIME_DIR.resolve()
-        if resolved_output == resolved_runtime or resolved_runtime not in resolved_output.parents:
-            raise SystemExit(f"Refusing to clean output directory outside project runtime/: {resolved_output}")
-        shutil.rmtree(output_dir)
+        if output_root == resolved_runtime or resolved_runtime not in output_root.parents:
+            raise SystemExit(f"Refusing to clean output directory outside project runtime/: {output_root}")
+        shutil.rmtree(output_root)
+    run_id = datetime.now(BEIJING_TZ).strftime("%Y%m%d-%H%M%S-%f")
+    output_dir = output_root / "runs" / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
+    report_file = output_dir / "_collection_report.json"
 
     bootstrap = PROJECT_DIR / "runtime" / "run_mediacrawler_douyin_creator.py"
+    bootstrap.parent.mkdir(parents=True, exist_ok=True)
     creator_id = creator_id_from_url(args.creator_url)
     bootstrap.write_text(
         "\n".join(
             [
                 "from pathlib import Path",
-                "import runpy, sys",
+                "import asyncio, json, runpy, sys",
                 f"media_dir = Path({str(media_dir)!r})",
                 "sys.path.insert(0, str(media_dir))",
                 "import config",
+                "from media_platform.douyin.core import DouYinCrawler",
+                "from media_platform.douyin.client import DouYinClient",
+                "_original_create_douyin_client = DouYinCrawler.create_douyin_client",
+                "async def _create_douyin_client_with_navigation_retry(self, httpx_proxy):",
+                "    for attempt in range(3):",
+                "        try:",
+                "            return await _original_create_douyin_client(self, httpx_proxy)",
+                "        except Exception as exc:",
+                "            if 'Execution context was destroyed' not in str(exc) or attempt == 2:",
+                "                raise",
+                "            await self.context_page.wait_for_load_state('domcontentloaded', timeout=30000)",
+                "            await asyncio.sleep(1)",
+                "DouYinCrawler.create_douyin_client = _create_douyin_client_with_navigation_retry",
+                "_original_get_aweme_detail = DouYinCrawler.get_aweme_detail",
+                "async def _get_aweme_detail_with_network_retry(self, aweme_id, semaphore):",
+                "    for attempt in range(3):",
+                "        try:",
+                "            return await _original_get_aweme_detail(self, aweme_id, semaphore)",
+                "        except Exception as exc:",
+                "            if attempt == 2:",
+                "                print(f'[collector] skipped aweme {aweme_id} after network retries: {type(exc).__name__}')",
+                "                return None",
+                "            await asyncio.sleep(2 ** attempt)",
+                "DouYinCrawler.get_aweme_detail = _get_aweme_detail_with_network_retry",
+                f"collection_mode = {mode!r}",
+                f"known_ids = set({sorted(known_ids)!r})",
+                f"probe_count = {max(1, int(args.incremental_probe_count))}",
+                f"report_file = Path({str(report_file)!r})",
+                "if collection_mode == 'incremental':",
+                "    async def _get_incremental_user_aweme_posts(self, sec_user_id, callback=None):",
+                "        posts_has_more, max_cursor, checked = 1, '', 0",
+                "        result, scanned_ids, seen_ids = [], [], set()",
+                "        boundary_seen, boundary_id = False, None",
+                "        stop_reason = 'history_exhausted'",
+                "        while posts_has_more == 1:",
+                "            response = await self.get_user_aweme_posts(sec_user_id, max_cursor)",
+                "            posts_has_more = response.get('has_more', 0)",
+                "            max_cursor = response.get('max_cursor')",
+                "            page = response.get('aweme_list') or []",
+                "            page = sorted(page, key=lambda item: int(item.get('create_time') or 0), reverse=True)",
+                "            selected = []",
+                "            should_stop = False",
+                "            for item in page:",
+                "                work_id = str(item.get('aweme_id') or '')",
+                "                if not work_id or work_id in seen_ids:",
+                "                    continue",
+                "                seen_ids.add(work_id)",
+                "                selected.append(item)",
+                "                scanned_ids.append(work_id)",
+                "                checked += 1",
+                "                if work_id in known_ids:",
+                "                    boundary_seen = True",
+                "                    boundary_id = boundary_id or work_id",
+                "                if boundary_seen and checked >= probe_count:",
+                "                    should_stop = True",
+                "                    stop_reason = 'known_boundary'",
+                "                    break",
+                "            if callback and selected:",
+                "                await callback(selected)",
+                "            result.extend(selected)",
+                "            if should_stop:",
+                "                break",
+                "        report = {",
+                "            'mode': collection_mode, 'probe_count': probe_count,",
+                "            'checked_count': checked, 'scanned_aweme_ids': scanned_ids,",
+                "            'known_boundary_aweme_id': boundary_id, 'stop_reason': stop_reason,",
+                "        }",
+                "        report_file.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')",
+                "        return result",
+                "    DouYinClient.get_all_user_aweme_posts = _get_incremental_user_aweme_posts",
                 f"config.DY_CREATOR_ID_LIST = [{creator_id!r}]",
                 f"config.CRAWLER_MAX_NOTES_COUNT = {int(args.max_count)}",
                 f"config.SAVE_DATA_OPTION = {args.save_data_option!r}",
@@ -384,28 +595,83 @@ def run_mediacrawler(args: argparse.Namespace) -> None:
     result = subprocess.run(command, cwd=media_dir, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise SystemExit(result.returncode)
+    report = read_existing_payload(report_file) if report_file.exists() else {
+        "mode": mode,
+        "probe_count": max(1, int(args.incremental_probe_count)),
+        "stop_reason": "history_exhausted" if mode == "full" else "report_missing",
+    }
+    return output_dir, report
 
 
 def collect(args: argparse.Namespace) -> dict[str, Any]:
-    if not args.normalize_only:
-        run_mediacrawler(args)
+    output_file = Path(args.output_file).expanduser().resolve()
+    state_file = Path(args.collection_state_file).expanduser().resolve() if args.collection_state_file else None
+    creator_id = creator_id_from_url(args.creator_url)
+    existing_payload = read_existing_payload(output_file)
+    existing_works = works_from_payload(existing_payload)
+    existing_ids = {str(item["aweme_id"]) for item in existing_works}
+    state = read_collection_state(state_file)
 
-    records, used_files = load_records_from_output(Path(args.media_output_dir).expanduser().resolve())
-    if not records:
+    if args.mark_existing_full:
+        if state_file is None:
+            raise SystemExit("--mark-existing-full requires --collection-state-file.")
+        if not existing_works:
+            raise SystemExit("--mark-existing-full requires an existing normalized works file with at least one work.")
+        report = {"mode": "mark_existing_full", "stop_reason": "existing_file_confirmed"}
+        written_state = write_collection_state(
+            state_file, creator_id=creator_id, full_history_collected=True,
+            mode="mark_existing_full", works=existing_works, pending_ids=[], report=report,
+        )
+        return {
+            "output_file": str(output_file), "count": len(existing_works),
+            "collection_mode": "mark_existing_full", "full_history_collected": True,
+            "new_count": 0, "pending_count": len(written_state.get("pending_aweme_ids", [])),
+        }
+
+    mode = determine_collection_mode(state, creator_id, existing_works, args.force_full_collect)
+    if args.normalize_only:
+        source_dir = Path(args.media_output_dir).expanduser().resolve()
+        report = {"mode": "normalize_only", "stop_reason": "existing_output_normalized"}
+    else:
+        source_dir, report = run_mediacrawler(args, mode=mode, known_ids=existing_ids)
+
+    records, used_files = load_records_from_output(source_dir)
+    if not records and args.normalize_only:
         try:
             media_dir = resolve_media_crawler_dir(args.media_crawler_dir)
         except SystemExit:
             media_dir = None
         if media_dir:
             records, used_files = load_records_from_output(media_dir / "data")
-    works = dedupe_works(records)
-    if args.expect_min_count and len(works) < args.expect_min_count:
-        raise SystemExit(f"Only found {len(works)} works, below --expect-min-count={args.expect_min_count}.")
-    if not works:
+    current_works = dedupe_works(records)
+    if args.expect_min_count and len(current_works) < args.expect_min_count:
+        raise SystemExit(f"Only found {len(current_works)} works, below --expect-min-count={args.expect_min_count}.")
+    if not current_works:
         raise SystemExit("No Douyin works found in MediaCrawler output.")
-    validate_core_fields(works)
-    payload = build_payload(works, args.creator_url, used_files)
-    write_payload(payload, Path(args.output_file))
+    validate_core_fields(current_works)
+
+    new_ids_set = {str(item["aweme_id"]) for item in current_works} - existing_ids
+    merged_works = merge_works(existing_works, current_works)
+    new_ids = ordered_ids(new_ids_set, merged_works)
+    state_matches = str(state.get("creator_id") or "") == creator_id
+    old_pending = (
+        state.get("pending_aweme_ids", [])
+        if state_matches and isinstance(state.get("pending_aweme_ids"), list)
+        else []
+    )
+    pending_ids = ordered_ids([*old_pending, *new_ids], merged_works)
+    completed_full = mode == "full" and not args.normalize_only
+    full_history_collected = (state_matches and bool(state.get("full_history_collected"))) or completed_full
+    payload = build_payload(
+        merged_works, args.creator_url, used_files, mode=mode,
+        full_history_collected=full_history_collected, new_ids=new_ids,
+        pending_ids=pending_ids, report=report,
+    )
+    write_payload(payload, output_file)
+    write_collection_state(
+        state_file, creator_id=creator_id, full_history_collected=full_history_collected,
+        mode=mode, works=merged_works, pending_ids=pending_ids, report=report,
+    )
     return payload
 
 
@@ -416,6 +682,10 @@ def main() -> int:
     parser.add_argument("--media-crawler-python", help="Python executable with MediaCrawler dependencies. Defaults to MEDIACRAWLER_PYTHON or MediaCrawler/.venv.")
     parser.add_argument("--media-output-dir", default=str(DEFAULT_MEDIA_OUTPUT_DIR))
     parser.add_argument("--output-file", default=str(DEFAULT_OUTPUT_FILE))
+    parser.add_argument("--collection-state-file", help="Per-creator incremental collection state JSON.")
+    parser.add_argument("--incremental-probe-count", type=int, default=3, help="Minimum newest works inspected before stopping at a known work.")
+    parser.add_argument("--force-full-collect", action="store_true", help="Ignore the completed baseline marker and crawl all history again.")
+    parser.add_argument("--mark-existing-full", action="store_true", help="Mark the existing normalized works file as a complete baseline without network access.")
     parser.add_argument("--max-count", type=int, default=200)
     parser.add_argument("--expect-min-count", type=int, default=1)
     parser.add_argument("--login-type", default="qrcode", choices=["qrcode", "phone", "cookie"])
@@ -423,8 +693,16 @@ def main() -> int:
     parser.add_argument("--normalize-only", action="store_true", help="Skip running MediaCrawler; only normalize existing output files.")
     parser.add_argument("--clean-media-output", action="store_true")
     args = parser.parse_args()
+    if args.incremental_probe_count < 1:
+        parser.error("--incremental-probe-count must be at least 1")
     payload = collect(args)
-    print(json.dumps({"output_file": str(Path(args.output_file)), "count": payload["count"]}, ensure_ascii=False, indent=2))
+    print(json.dumps({
+        "output_file": str(Path(args.output_file)),
+        "count": payload["count"],
+        "collection_mode": payload.get("collection_mode"),
+        "new_count": payload.get("new_count", 0),
+        "pending_count": payload.get("pending_count", 0),
+    }, ensure_ascii=False, indent=2))
     return 0
 
 

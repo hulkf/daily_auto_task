@@ -58,7 +58,7 @@ class Logger:
             if self.persist:
                 with self.path.open("a", encoding="utf-8") as handle:
                     handle.write(line + "\n")
-            print(line)
+            print_console(line)
 
 
 class Runner:
@@ -134,6 +134,13 @@ def truncate(text: str, limit: int = 4000) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f" ... <省略 {len(text) - limit} 个字符>"
+
+
+def print_console(text: str, *, file: Any = None) -> None:
+    stream = file or sys.stdout
+    encoding = getattr(stream, "encoding", None) or "utf-8"
+    safe_text = text.encode(encoding, errors="replace").decode(encoding, errors="replace")
+    print(safe_text, file=stream)
 
 
 def now_text() -> str:
@@ -270,6 +277,43 @@ def write_selected_works_file(source_file: Path, selected: list[dict[str, Any]],
     return output_file
 
 
+def collection_state_path(state_dir: Path, creator: dict[str, Any]) -> Path:
+    return state_dir / "collection" / f"{safe_key(creator_key(creator))}.json"
+
+
+def pending_collection_ids(state_file: Path, works_file: Path) -> list[str]:
+    payload: dict[str, Any] = {}
+    if state_file.exists():
+        try:
+            payload = read_json(state_file)
+        except PipelineError:
+            payload = {}
+    if not payload and works_file.exists():
+        payload = read_json(works_file)
+    values = payload.get("pending_aweme_ids", [])
+    if not isinstance(values, list):
+        return []
+    return list(dict.fromkeys(str(value) for value in values if str(value)))
+
+
+def complete_collection_pending(state_file: Path, works_file: Path, completed_ids: Iterable[str]) -> None:
+    completed = {str(value) for value in completed_ids}
+    if not completed:
+        return
+    for path in (state_file, works_file):
+        if not path.exists():
+            continue
+        payload = read_json(path)
+        pending = payload.get("pending_aweme_ids", [])
+        if not isinstance(pending, list):
+            continue
+        remaining = [str(value) for value in pending if str(value) not in completed]
+        payload["pending_aweme_ids"] = remaining
+        payload["pending_count"] = len(remaining)
+        payload["last_pipeline_completed_at"] = now_text()
+        write_json(path, payload)
+
+
 def load_state(path: Path, creator: dict[str, Any], work: dict[str, Any]) -> dict[str, Any]:
     try:
         state = read_json(path) if path.exists() else {}
@@ -379,7 +423,8 @@ def child_env(config: dict[str, Any]) -> dict[str, str]:
 
 def collect_command(
     config: dict[str, Any], creator: dict[str, Any], works_file: Path,
-    media_output: Path, normalize_only: bool,
+    media_output: Path, collection_state_file: Path, normalize_only: bool,
+    force_full_collect: bool = False,
 ) -> list[str]:
     defaults = section(config, "collection")
     creator_url = str(creator.get("creator_url") or "").strip()
@@ -390,6 +435,8 @@ def collect_command(
         "--creator-url", creator_url,
         "--media-output-dir", media_output,
         "--output-file", works_file,
+        "--collection-state-file", collection_state_file,
+        "--incremental-probe-count", chosen(creator, defaults, "incremental_probe_count", 3),
         "--max-count", chosen(creator, defaults, "max_count", 200),
         "--expect-min-count", chosen(creator, defaults, "expect_min_count", 1),
         "--login-type", chosen(creator, defaults, "login_type", "qrcode"),
@@ -399,6 +446,9 @@ def collect_command(
     append_option(command, "--media-crawler-python", chosen(creator, defaults, "media_crawler_python"))
     if chosen(creator, defaults, "clean_media_output", False):
         command.append("--clean-media-output")
+    incremental_enabled = bool(chosen(creator, defaults, "incremental_enabled", True))
+    if force_full_collect or not incremental_enabled:
+        command.append("--force-full-collect")
     if normalize_only:
         command.append("--normalize-only")
     return command
@@ -1106,18 +1156,26 @@ def process_creator(
     works_file = path_from(creator.get("works_file"), PROJECT_DIR / "runtime" / f"{key}-works-from-mediacrawler.json")
     profile_file = path_from(creator.get("profile_file"))
     media_output = path_from(creator.get("media_output_dir"), PROJECT_DIR / "runtime" / f"mediacrawler-output-{key}")
+    state_dir = path_from(config.get("state_dir"), DEFAULT_STATE_DIR) or DEFAULT_STATE_DIR
+    media_dir = path_from(config.get("media_dir"), DEFAULT_MEDIA_DIR) or DEFAULT_MEDIA_DIR
     if works_file is None or media_output is None:
         raise PipelineError(f"达人 {key} 的路径配置无效。")
+    collection_state_file = collection_state_path(state_dir, creator)
     result: dict[str, Any] = {"key": key, "creator_name": name, "works_file": str(works_file), "works": []}
 
     collection_ok = True
+    collection_attempted = not args.skip_collect
     if args.skip_collect:
         logger.write(f"跳过采集 {name}")
     else:
         try:
             runner.run(
                 f"采集 {name}",
-                collect_command(config, creator, works_file, media_output, args.normalize_only), env,
+                collect_command(
+                    config, creator, works_file, media_output, collection_state_file,
+                    args.normalize_only, args.force_full_collect,
+                ),
+                env,
             )
         except Exception as exc:
             collection_ok = False
@@ -1135,11 +1193,27 @@ def process_creator(
 
     all_works = load_works(works_file)
     maximum = args.max_works if args.max_works is not None else int(config.get("max_works") or 0)
-    selected = select_works(all_works, set(args.aweme_id), maximum)
+    requested_ids = set(args.aweme_id)
+    pending_selection = False
+    if requested_ids:
+        selected = select_works(all_works, requested_ids, maximum)
+    elif collection_attempted:
+        pending_selection = True
+        pending_ids = pending_collection_ids(collection_state_file, works_file)
+        selected = select_works(all_works, set(pending_ids), maximum) if pending_ids else []
+        result["pending_count"] = len(pending_ids)
+    else:
+        selected = select_works(all_works, set(), maximum)
     result["selected_count"] = len(selected)
     logger.write(f"{name} 本轮选择 {len(selected)} / {len(all_works)} 条作品")
-    state_dir = path_from(config.get("state_dir"), DEFAULT_STATE_DIR) or DEFAULT_STATE_DIR
-    media_dir = path_from(config.get("media_dir"), DEFAULT_MEDIA_DIR) or DEFAULT_MEDIA_DIR
+
+    if pending_selection and not selected:
+        result["backup_mappings"] = {}
+        result["status"] = "success" if collection_ok else "partial_failure"
+        logger.write(f"{name} 没有待处理的新作品，跳过飞书、ASR 和备份阶段")
+        logger.write(f"========== 达人结束: {name}，状态 {result['status']} ==========")
+        return result
+
     result["backup_mappings"] = sync_creator_backup_mappings(
         config, creator, profile_file, state_dir, runner, logger, env, args,
     )
@@ -1158,7 +1232,7 @@ def process_creator(
     sync_ok = True
     synced_record_ids: dict[str, str] = {}
     sync_works_file = works_file
-    should_limit_sync = bool(args.aweme_id) or maximum > 0
+    should_limit_sync = bool(requested_ids) or maximum > 0 or pending_selection
     if should_limit_sync and not args.dry_run:
         sync_works_file = write_selected_works_file(
             works_file, selected, state_dir / "selected_works" / f"{key}.json",
@@ -1243,6 +1317,10 @@ def process_creator(
     failed_work = any("failed" in item["stages"].values() for item in result["works"])
     mapping_failed = "failed" in result["backup_mappings"].values()
     result["status"] = "partial_failure" if (not collection_ok or not sync_ok or mapping_failed or failed_work) else "success"
+    if result["status"] == "success" and not args.dry_run:
+        complete_collection_pending(
+            collection_state_file, works_file, [str(work["aweme_id"]) for work in selected],
+        )
     logger.write(f"========== 达人结束: {name}，状态 {result['status']} ==========")
     return result
 
@@ -1263,6 +1341,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip-collect", action="store_true")
     parser.add_argument("--normalize-only", action="store_true", help="采集阶段只规范化已有 MediaCrawler 输出")
+    parser.add_argument("--force-full-collect", action="store_true", help="忽略全量基线标记，强制重新抓取全部历史作品")
     parser.add_argument("--skip-feishu-sync", action="store_true")
     parser.add_argument("--skip-transcribe", action="store_true")
     parser.add_argument("--skip-correction", action="store_true")
@@ -1342,7 +1421,7 @@ def main(argv: list[str] | None = None) -> int:
             state_dir = path_from(config.get("state_dir"), DEFAULT_STATE_DIR) or DEFAULT_STATE_DIR
             write_json(state_dir / "runs" / f"{run_id}.json", summary)
         logger.write(f"流水线结束，状态={summary['status']}")
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        print_console(json.dumps(summary, ensure_ascii=False, indent=2))
         return 1 if failed else 0
     except PipelineError as exc:
         failure_summary = {
@@ -1360,7 +1439,7 @@ def main(argv: list[str] | None = None) -> int:
                 write_json(state_dir / "runs" / f"{run_id}.json", failure_summary)
             except (OSError, PipelineError):
                 pass
-        print(json.dumps(failure_summary, ensure_ascii=False), file=sys.stderr)
+        print_console(json.dumps(failure_summary, ensure_ascii=False), file=sys.stderr)
         return 2
 
 

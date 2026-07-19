@@ -52,6 +52,30 @@ douyin_creator_monitor/local/feishu-ids.md
 夸克网盘 CLI 已按本项目约定安装到本地 `tools/kuake-cli/`，真实登录态放在 `douyin_creator_monitor/local/kuake.env.json`。火山 ASR 得到的 `.txt` 文案可用 `scripts/backup_transcripts_to_kuake.py` 上传到指定夸克目录，默认按 `/视频文案备份/博主名/日期_视频ID_标题.txt` 组织。具体步骤见 `docs/kuake-backup.md`。
 
 
+## 增量抓取与新增作品队列
+
+采集器现在按达人维护一份全量基线标记。首次成功抓取全部历史作品后，状态写入：
+
+~~~text
+runtime/pipeline/collection/<达人key>.json
+~~~
+
+后续运行会自动切换为增量模式：先按发布时间检查最近至少 3 条作品；一旦遇到已经存在的作品边界，就停止继续翻页。如果最近 3 条全部是新作品，则继续向后检查，直到遇到已知作品；如果始终没有遇到已知作品，则继续抓到历史末尾，避免漏掉大批新增作品。最近检查到的已知作品仍会刷新点赞、评论、收藏和分享数据。
+
+规范化作品文件继续保存完整历史，但流水线下游只选择 `pending_aweme_ids` 中尚未成功处理的新增作品。`--max-works` 只限制本轮处理数量，未处理完的 ID 会继续留在 pending 队列，下一次断点续跑，不会因为限流永久丢失。没有新增作品且 pending 为空时，会直接跳过飞书同步、ASR、IMA、夸克和 Obsidian。
+
+如果已有作品 JSON 已确认包含该达人全部历史，可以不访问网络，直接建立基线标记：
+
+~~~powershell
+python .\douyin_creator_monitor\scripts\collect_douyin_creator_with_mediacrawler.py `
+  --creator-url "<达人主页或 SecUID>" `
+  --output-file .\douyin_creator_monitor\runtime\<达人key>-works-from-mediacrawler.json `
+  --collection-state-file .\douyin_creator_monitor\runtime\pipeline\collection\<达人key>.json `
+  --mark-existing-full
+~~~
+
+需要重新校验全部历史时，可以在完整流水线入口增加 `--force-full-collect`。配置模板中的 `collection.incremental_enabled` 默认是 `true`，`collection.incremental_probe_count` 默认是 `3`。每次 MediaCrawler 原始输出写入独立的 `runtime/mediacrawler-output-<达人key>/runs/<运行ID>/`，避免旧数据与本轮数据混合。
+
 ## 完整自动化流水线
 
 统一入口：

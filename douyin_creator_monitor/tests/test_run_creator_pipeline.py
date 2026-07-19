@@ -131,6 +131,16 @@ class PipelineHelpersTest(unittest.TestCase):
                 marker_path=marker, expected_creator_name=creator_name,
             ))
 
+    def test_logger_replaces_characters_unsupported_by_console_encoding(self):
+        class GbkStream(io.StringIO):
+            encoding = "gbk"
+
+        stream = GbkStream()
+        logger = PIPELINE.Logger(Path("unused.log"), persist=False)
+        with patch.object(PIPELINE.sys, "stdout", stream):
+            logger.write("unsupported: ʹ")
+        self.assertIn("unsupported: ?", stream.getvalue())
+
     def test_runner_records_precise_success_timing(self):
         logger = PIPELINE.Logger(Path("unused.log"), persist=False)
         runner = PIPELINE.Runner(logger, dry_run=False)
@@ -229,6 +239,72 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertFalse(PIPELINE.finalizer_needed(stages, None, "success", resume=True))
         self.assertTrue(PIPELINE.finalizer_needed({**stages, "kuake_backed_up": "failed"}, None, "success", resume=True))
         self.assertTrue(PIPELINE.finalizer_needed(stages, Path("final.txt"), "success", resume=True))
+
+
+    def test_pending_collection_ids_prefers_state_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_file = root / "collection.json"
+            works_file = root / "works.json"
+            state_file.write_text(json.dumps({"pending_aweme_ids": ["3", "2", "2"]}), encoding="utf-8")
+            works_file.write_text(json.dumps({"pending_aweme_ids": ["1"]}), encoding="utf-8")
+            self.assertEqual(PIPELINE.pending_collection_ids(state_file, works_file), ["3", "2"])
+
+    def test_complete_collection_pending_only_removes_processed_subset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_file = root / "collection.json"
+            works_file = root / "works.json"
+            payload = {"pending_aweme_ids": ["new-3", "new-2", "new-1"], "pending_count": 3}
+            state_file.write_text(json.dumps(payload), encoding="utf-8")
+            works_file.write_text(json.dumps(payload), encoding="utf-8")
+
+            PIPELINE.complete_collection_pending(state_file, works_file, ["new-3"])
+
+            for path in (state_file, works_file):
+                updated = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(updated["pending_aweme_ids"], ["new-2", "new-1"])
+                self.assertEqual(updated["pending_count"], 2)
+                self.assertIn("last_pipeline_completed_at", updated)
+
+    def test_max_works_limits_pending_selection_without_discarding_remainder(self):
+        works = [
+            {"aweme_id": "new-3", "create_time": 3},
+            {"aweme_id": "new-2", "create_time": 2},
+            {"aweme_id": "new-1", "create_time": 1},
+        ]
+        selected = PIPELINE.select_works(works, {"new-3", "new-2", "new-1"}, 1)
+        self.assertEqual([item["aweme_id"] for item in selected], ["new-3"])
+
+    def test_collect_command_passes_incremental_state_and_probe(self):
+        config = {
+            "python": "python",
+            "collection": {"incremental_probe_count": 3, "incremental_enabled": True},
+        }
+        creator = {"key": "demo", "creator_url": "creator-id"}
+        command = PIPELINE.collect_command(
+            config,
+            creator,
+            Path("works.json"),
+            Path("media-output"),
+            Path("collection-state.json"),
+            False,
+        )
+        self.assertIn("--collection-state-file", command)
+        self.assertIn("collection-state.json", command)
+        self.assertIn("--incremental-probe-count", command)
+        self.assertNotIn("--force-full-collect", command)
+
+        forced = PIPELINE.collect_command(
+            config,
+            creator,
+            Path("works.json"),
+            Path("media-output"),
+            Path("collection-state.json"),
+            False,
+            True,
+        )
+        self.assertIn("--force-full-collect", forced)
 
 
 if __name__ == "__main__":
