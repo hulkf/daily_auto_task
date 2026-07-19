@@ -260,6 +260,16 @@ def select_works(works: list[dict[str, Any]], ids: set[str], maximum: int) -> li
     return selected[:maximum] if maximum > 0 else selected
 
 
+def write_selected_works_file(source_file: Path, selected: list[dict[str, Any]], output_file: Path) -> Path:
+    payload = read_json(source_file)
+    payload["works"] = selected
+    payload["count"] = len(selected)
+    payload["source_file"] = str(source_file)
+    payload["selected_at"] = now_text()
+    write_json(output_file, payload)
+    return output_file
+
+
 def load_state(path: Path, creator: dict[str, Any], work: dict[str, Any]) -> dict[str, Any]:
     try:
         state = read_json(path) if path.exists() else {}
@@ -1147,12 +1157,20 @@ def process_creator(
 
     sync_ok = True
     synced_record_ids: dict[str, str] = {}
+    sync_works_file = works_file
+    should_limit_sync = bool(args.aweme_id) or maximum > 0
+    if should_limit_sync and not args.dry_run:
+        sync_works_file = write_selected_works_file(
+            works_file, selected, state_dir / "selected_works" / f"{key}.json",
+        )
+    if should_limit_sync:
+        logger.write(f"飞书作品同步使用本轮选择作品文件: {sync_works_file}")
     if args.skip_feishu_sync:
         logger.write(f"跳过飞书作品同步 {name}")
     else:
         try:
             sync_output = runner.run(
-                f"飞书作品同步 {name}", sync_command(config, creator, works_file), env,
+                f"飞书作品同步 {name}", sync_command(config, creator, sync_works_file), env,
                 sensitive=("--table-id", "--base-token"),
             )
             synced_record_ids = parse_sync_record_ids(sync_output)

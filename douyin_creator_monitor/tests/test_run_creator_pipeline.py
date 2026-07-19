@@ -27,6 +27,24 @@ class PipelineHelpersTest(unittest.TestCase):
         selected = PIPELINE.select_works(works, {"middle"}, 0)
         self.assertEqual([item["aweme_id"] for item in selected], ["middle"])
 
+    def test_write_selected_works_file_limits_payload(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory_path = Path(directory)
+            source = directory_path / "works.json"
+            output = directory_path / "selected" / "works.json"
+            source.write_text(
+                json.dumps({"count": 3, "works": [{"aweme_id": "1"}, {"aweme_id": "2"}, {"aweme_id": "3"}]}),
+                encoding="utf-8",
+            )
+
+            PIPELINE.write_selected_works_file(source, [{"aweme_id": "2"}], output)
+
+            payload = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(payload["count"], 1)
+            self.assertEqual(payload["works"], [{"aweme_id": "2"}])
+            self.assertEqual(payload["source_file"], str(source))
+            self.assertIn("selected_at", payload)
+
     def test_audio_url_prefers_normalized_then_raw(self):
         self.assertEqual(PIPELINE.audio_url({"music_download_url": "direct", "raw": {"music_download_url": "raw"}}), "direct")
         self.assertEqual(PIPELINE.audio_url({"raw": {"music_download_url": ["raw-list"]}}), "raw-list")
