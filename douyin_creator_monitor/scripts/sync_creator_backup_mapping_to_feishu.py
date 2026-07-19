@@ -90,50 +90,55 @@ def search_creator_record(
     cli: str, base_token: str, table_id: str, match_field: str,
     match_value: str, as_identity: str,
 ) -> str:
-    payload = run_lark(
-        cli,
-        [
-            "base", "+record-search", "--base-token", base_token,
-            "--table-id", table_id, "--keyword", match_value,
-            "--search-field", match_field, "--field-id", match_field,
-            "--limit", "10", "--format", "json", "--as", as_identity,
-        ],
-    )
-    try:
-        return find_record_id(payload, match_field, match_value)
-    except MappingSyncError:
-        # Some Base tables do not return row objects from keyword search even
-        # for an exact text match. Use a field-scoped list as a deterministic
-        # fallback and compare the returned cell value ourselves.
-        matches: list[str] = []
-        offset = 0
-        while True:
-            listed = run_lark(
-                cli,
-                [
-                    "base", "+record-list", "--base-token", base_token,
-                    "--table-id", table_id, "--field-id", match_field,
-                    "--offset", str(offset), "--limit", "200",
-                    "--format", "json", "--as", as_identity,
-                ],
-            )
-            data = listed.get("data") if isinstance(listed.get("data"), dict) else {}
-            rows = data.get("data") if isinstance(data.get("data"), list) else []
-            record_ids = data.get("record_id_list") if isinstance(data.get("record_id_list"), list) else []
-            matches.extend(
-                record_id
-                for row, record_id in zip(rows, record_ids)
-                if isinstance(row, list) and row and str(row[0] or "").strip() == match_value
-            )
-            if not data.get("has_more"):
-                break
-            offset += 200
-        unique = list(dict.fromkeys(matches))
-        if not unique:
-            raise MappingSyncError(f"达人基础信息表中未找到 {match_field}={match_value}。")
-        if len(unique) > 1:
-            raise MappingSyncError(f"达人基础信息表中 {match_field}={match_value} 匹配到多条记录。")
-        return unique[0]
+    # Feishu keyword search rejects strings longer than 50 characters. Douyin
+    # SecUID values can exceed that limit, so use the field-scoped list fallback
+    # directly for long exact identifiers.
+    if len(match_value) <= 50:
+        payload = run_lark(
+            cli,
+            [
+                "base", "+record-search", "--base-token", base_token,
+                "--table-id", table_id, "--keyword", match_value,
+                "--search-field", match_field, "--field-id", match_field,
+                "--limit", "10", "--format", "json", "--as", as_identity,
+            ],
+        )
+        try:
+            return find_record_id(payload, match_field, match_value)
+        except MappingSyncError:
+            pass
+
+    # Some Base tables do not return row objects from keyword search even for
+    # an exact text match. List only the target field and compare cell values.
+    matches: list[str] = []
+    offset = 0
+    while True:
+        listed = run_lark(
+            cli,
+            [
+                "base", "+record-list", "--base-token", base_token,
+                "--table-id", table_id, "--field-id", match_field,
+                "--offset", str(offset), "--limit", "200",
+                "--format", "json", "--as", as_identity,
+            ],
+        )
+        data = listed.get("data") if isinstance(listed.get("data"), dict) else {}
+        rows = data.get("data") if isinstance(data.get("data"), list) else []
+        record_ids = data.get("record_id_list") if isinstance(data.get("record_id_list"), list) else []
+        matches.extend(
+            record_id
+            for row, record_id in zip(rows, record_ids)
+            if isinstance(row, list) and row and str(row[0] or "").strip() == match_value
+        )
+        if not data.get("has_more"):
+            break
+        offset += 200
+    unique = list(dict.fromkeys(matches))
+    if not unique:
+        raise MappingSyncError(f"??????????? {match_field}={match_value}?")
+    if len(unique) > 1:
+        raise MappingSyncError(f"???????? {match_field}={match_value} ????????")
+    return unique[0]
 
 
 def get_record_fields(

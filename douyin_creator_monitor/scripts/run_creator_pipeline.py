@@ -602,7 +602,7 @@ def writeback_command(
 
 
 def final_backup_status(outcome: str, success_value: str) -> str:
-    if outcome in {"success", "skipped"}:
+    if outcome in {"success", "skipped", "planned"}:
         return success_value
     if outcome == "disabled":
         return "跳过"
@@ -640,6 +640,24 @@ def status_writeback_command(
     append_option(command, "--as", feishu.get("as_identity"))
     append_option(command, "--record-id", record_id)
     append_option(command, "--transcript-file", transcript_file)
+    append_option(command, "--transcript-field", feishu.get("transcript_field"))
+    return command
+
+
+def status_writeback_batch_command(
+    config: dict[str, Any], creator: dict[str, Any], manifest: Path,
+) -> list[str]:
+    table = str(creator.get("works_table_id") or "").strip()
+    if not table:
+        raise PipelineError(f"达人 {creator_key(creator)} 缺少 works_table_id。")
+    feishu = section(config, "feishu")
+    command = py(
+        config, "feishu_work_status_writer.py",
+        "--table-id", table, "--manifest", str(manifest),
+    )
+    append_option(command, "--work-id-field", feishu.get("work_id_field"))
+    append_option(command, "--lark-cli", feishu.get("lark_cli"))
+    append_option(command, "--as", feishu.get("as_identity"))
     append_option(command, "--transcript-field", feishu.get("transcript_field"))
     return command
 
@@ -697,6 +715,23 @@ def kuake_command(config: dict[str, Any], creator: dict[str, Any], work: dict[st
         "--video-date", date_of(work), "--video-id", str(work["aweme_id"]),
         "--title", safe_external_title(work), "--create-dir",
     ])
+    append_option(command, "--base-dir", kuake.get("base_dir"))
+    append_option(command, "--remote-dir", creator.get("kuake_remote_dir"))
+    return command
+
+
+def kuake_batch_command(
+    config: dict[str, Any], creator: dict[str, Any], manifest: Path,
+) -> list[str]:
+    kuake = section(config, "kuake")
+    name = str(creator.get("creator_dir_name") or creator.get("creator_name") or "").strip()
+    if not name:
+        raise PipelineError("缺少夸克达人目录名称。")
+    command = py(config, "backup_transcripts_to_kuake.py")
+    append_option(command, "--local-env", path_from(kuake.get("local_env"), PROJECT_DIR / "local" / "kuake.env.json"))
+    if kuake.get("kuake_exe"):
+        append_option(command, "--kuake-exe", path_from(kuake["kuake_exe"]))
+    command.extend(["upload-manifest", "--manifest", str(manifest), "--creator-name", name])
     append_option(command, "--base-dir", kuake.get("base_dir"))
     append_option(command, "--remote-dir", creator.get("kuake_remote_dir"))
     return command
@@ -960,6 +995,8 @@ def mapping_cache_is_fresh(
         marker = json.loads(marker_path.read_text(encoding="utf-8-sig"))
         if expected_creator_key is not None and marker.get("creator_key") != expected_creator_key:
             return False
+        if marker.get("feishu_writeback") == "disabled":
+            return False
         if marker.get("signature") != mapping_cache_signature(paths):
             return False
     except (OSError, json.JSONDecodeError):
@@ -1016,6 +1053,22 @@ def run_independent_actions(
             outcomes[futures[future]] = future.result()
     return outcomes
 
+
+def permanent_delivery_error(error: str) -> bool:
+    text = str(error or "").lower()
+    transient = (
+        "timeout", "timed out", "429", "too many requests", "500", "502", "503", "504",
+        "dns", "connection reset", "connection aborted", "temporarily unavailable", "网络超时",
+        "连接中断", "临时",
+    )
+    if any(marker in text for marker in transient):
+        return False
+    permanent = (
+        "credential", "cookie", "token invalid", "unauthorized", "forbidden", "permission denied",
+        "access denied", "not configured", "missing config", "knowledge base", "folder mapping",
+        "凭证", "登录态", "未配置", "配置缺失", "权限", "知识库不存在", "目录映射错误",
+    )
+    return any(marker in text for marker in permanent)
 
 def prepare_work(
     config: dict[str, Any], creator: dict[str, Any], work: dict[str, Any],
@@ -1144,7 +1197,9 @@ def process_downstream(
         result["stages"]["feishu_written_back"] = "disabled"
     elif not final_available:
         result["stages"]["feishu_written_back"] = "blocked"
-    elif should_skip(state, "feishu_written_back", args.resume, args.force_stage):
+    elif not getattr(args, "feishu_only", False) and should_skip(
+        state, "feishu_written_back", args.resume, args.force_stage,
+    ):
         logger.write(f"跳过 回写飞书 {work_id}：状态已完成")
         result["stages"]["feishu_written_back"] = "skipped"
     else:
@@ -1154,19 +1209,19 @@ def process_downstream(
     backups: list[tuple[str, bool, str, Callable[[], None]]] = [
         (
             "ima_backed_up",
-            args.skip_ima or not bool(section(config, "ima").get("enabled", True)),
+            args.skip_ima or getattr(args, "feishu_only", False) or not bool(section(config, "ima").get("enabled", True)),
             f"备份 IMA {work_id}",
             lambda: runner.run(f"备份 IMA {work_id}", ima_command(config, creator, paths), env),
         ),
         (
             "kuake_backed_up",
-            args.skip_kuake or not bool(section(config, "kuake").get("enabled", True)),
+            args.skip_kuake or getattr(args, "feishu_only", False) or not bool(section(config, "kuake").get("enabled", True)),
             f"备份夸克 {work_id}",
             lambda: runner.run(f"备份夸克 {work_id}", kuake_command(config, creator, work, paths), env),
         ),
         (
             "obsidian_exported",
-            args.skip_obsidian or not bool(section(config, "obsidian").get("enabled", True)),
+            args.skip_obsidian or getattr(args, "feishu_only", False) or not bool(section(config, "obsidian").get("enabled", True)),
             f"备份 Obsidian {work_id}",
             lambda: runner.run(
                 f"备份 Obsidian {work_id}",
@@ -1175,14 +1230,32 @@ def process_downstream(
         ),
     ]
     runnable: list[tuple[str, Callable[[], None]]] = []
+    breakers = getattr(args, "_delivery_breakers", {})
     for stage, disabled, label, action in backups:
         if disabled:
-            result["stages"][stage] = "disabled"
+            if getattr(args, "feishu_only", False):
+                persisted = status_of(state, stage)
+                result["stages"][stage] = (
+                    "skipped" if persisted == "success"
+                    else "failed" if persisted == "failed"
+                    else "disabled"
+                )
+            else:
+                result["stages"][stage] = "disabled"
         elif not final_available:
             result["stages"][stage] = "blocked"
         elif should_skip(state, stage, args.resume, args.force_stage):
             logger.write(f"跳过 {label}：状态已完成")
             result["stages"][stage] = "skipped"
+        elif stage == "kuake_backed_up" and getattr(args, "_defer_kuake", False):
+            result["stages"][stage] = "pending"
+        elif stage in breakers:
+            detail = str(breakers[stage])
+            logger.write(f"熔断 {label}: {detail}")
+            result["stages"][stage] = "failed"
+            if not args.dry_run:
+                set_status(state, stage, "failed", detail)
+                write_json(state_path, state)
         else:
             runnable.append((stage, action))
 
@@ -1194,7 +1267,10 @@ def process_downstream(
         status = str(outcome["status"])
         result["stages"][stage] = status
         if status == "failed":
-            logger.write(f"失败 {stage}: {outcome.get('error', '')}")
+            detail = str(outcome.get("error") or "")
+            logger.write(f"失败 {stage}: {detail}")
+            if permanent_delivery_error(detail):
+                breakers[stage] = detail
         if not args.dry_run:
             set_status(
                 state, stage, status, str(outcome.get("error") or ""),
@@ -1205,6 +1281,22 @@ def process_downstream(
         write_json(state_path, state)
     if args.fail_fast and any(item.get("status") == "failed" for item in outcomes.values()):
         raise PipelineError(f"作品 {work_id} 存在备份失败阶段。")
+    if getattr(args, "_defer_feishu_writeback", False):
+        if args.skip_feishu_writeback:
+            result["stages"]["backup_statuses_written_back"] = "disabled"
+        elif finalizer_needed(
+            result["stages"], transcript_file,
+            status_of(state, "backup_statuses_written_back"), args.resume,
+        ):
+            result["stages"]["backup_statuses_written_back"] = "pending"
+        else:
+            result["stages"]["backup_statuses_written_back"] = "skipped"
+        result["_batch"] = {
+            "state_path": str(state_path),
+            "transcript_file": str(transcript_file) if transcript_file is not None else "",
+            "record_id": record_id or "",
+        }
+        return result
     if args.skip_feishu_writeback:
         result["stages"]["backup_statuses_written_back"] = "disabled"
         return result
@@ -1432,6 +1524,158 @@ def collect_creator_phase(
     }
 
 
+def parse_batch_results(output: str) -> dict[str, dict[str, Any]]:
+    if not output.strip():
+        return {}
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        return {}
+    values = payload.get("results") if isinstance(payload, dict) else None
+    return values if isinstance(values, dict) else {}
+
+
+def work_has_failed_stage(stages: dict[str, Any], *, feishu_only: bool = False) -> bool:
+    if feishu_only:
+        return any(
+            stages.get(stage) == "failed"
+            for stage in ("feishu_written_back", "backup_statuses_written_back")
+        )
+    return "failed" in stages.values()
+
+
+def finalize_creator_batches(
+    config: dict[str, Any], creator: dict[str, Any], selected: list[dict[str, Any]],
+    delivery_results: dict[str, dict[str, Any]], state_dir: Path, runner: Runner,
+    logger: Logger, env: dict[str, str], args: argparse.Namespace,
+) -> None:
+    batch_dir = state_dir / "batches" / creator_key(creator)
+    work_by_id = {str(work["aweme_id"]): work for work in selected}
+
+    kuake_ids = [
+        work_id for work_id, item in delivery_results.items()
+        if item.get("stages", {}).get("kuake_backed_up") == "pending"
+    ]
+    if kuake_ids:
+        manifest_path = batch_dir / "kuake-upload.json"
+        payload = {
+            "creator_name": str(creator.get("creator_dir_name") or creator.get("creator_name") or ""),
+            "files": [
+                {
+                    "aweme_id": work_id,
+                    "path": delivery_results[work_id]["_batch"]["transcript_file"],
+                    "video_date": date_of(work_by_id[work_id]),
+                    "title": safe_external_title(work_by_id[work_id]),
+                }
+                for work_id in kuake_ids
+            ],
+        }
+        if not args.dry_run:
+            write_json(manifest_path, payload)
+        batch_started = time.perf_counter()
+        try:
+            output = runner.run(
+                f"夸克达人级批量上传 {creator_key(creator)} ({len(kuake_ids)}条)",
+                kuake_batch_command(config, creator, manifest_path), env,
+            )
+            batch_results = parse_batch_results(output)
+            batch_seconds = time.perf_counter() - batch_started
+            for work_id in kuake_ids:
+                outcome = batch_results.get(work_id, {})
+                status = "planned" if args.dry_run else str(outcome.get("status") or "failed")
+                detail = str(outcome.get("error") or "")
+                delivery_results[work_id]["stages"]["kuake_backed_up"] = status
+                if not args.dry_run:
+                    state_path = Path(delivery_results[work_id]["_batch"]["state_path"])
+                    state = load_state(state_path, creator, work_by_id[work_id])
+                    set_status(state, "kuake_backed_up", status, detail, duration_seconds=batch_seconds)
+                    write_json(state_path, state)
+        except Exception as exc:
+            detail = str(exc)
+            batch_seconds = time.perf_counter() - batch_started
+            logger.write(f"夸克达人级批量上传失败: {detail}")
+            for work_id in kuake_ids:
+                delivery_results[work_id]["stages"]["kuake_backed_up"] = "failed"
+                if not args.dry_run:
+                    state_path = Path(delivery_results[work_id]["_batch"]["state_path"])
+                    state = load_state(state_path, creator, work_by_id[work_id])
+                    set_status(state, "kuake_backed_up", "failed", detail, duration_seconds=batch_seconds)
+                    write_json(state_path, state)
+            if args.fail_fast:
+                raise
+
+    feishu_ids = [
+        work_id for work_id, item in delivery_results.items()
+        if item.get("stages", {}).get("backup_statuses_written_back") == "pending"
+    ]
+    if feishu_ids:
+        manifest_path = batch_dir / "feishu-final-writeback.json"
+        payload = {
+            "table_id": str(creator.get("works_table_id") or ""),
+            "records": [
+                {
+                    "work_id": work_id,
+                    "record_id": delivery_results[work_id]["_batch"].get("record_id") or "",
+                    "transcript_file": delivery_results[work_id]["_batch"].get("transcript_file") or "",
+                    "ima_status": final_backup_status(str(delivery_results[work_id]["stages"].get("ima_backed_up", "blocked")), "已上传"),
+                    "kuake_status": final_backup_status(str(delivery_results[work_id]["stages"].get("kuake_backed_up", "blocked")), "已上传"),
+                    "local_status": final_backup_status(str(delivery_results[work_id]["stages"].get("obsidian_exported", "blocked")), "已写入"),
+                }
+                for work_id in feishu_ids
+            ],
+        }
+        if not args.dry_run:
+            write_json(manifest_path, payload)
+        batch_started = time.perf_counter()
+        try:
+            output = runner.run(
+                f"飞书最终结果批量写回 {creator_key(creator)} ({len(feishu_ids)}条)",
+                status_writeback_batch_command(config, creator, manifest_path), env,
+                sensitive=("--table-id", "--base-token"),
+            )
+            batch_results = parse_batch_results(output)
+            batch_seconds = time.perf_counter() - batch_started
+            for work_id in feishu_ids:
+                outcome = batch_results.get(work_id, {})
+                status = "planned" if args.dry_run else str(outcome.get("status") or "failed")
+                success = status in {"success", "planned"}
+                transcript_included = bool(delivery_results[work_id]["_batch"].get("transcript_file"))
+                delivery_results[work_id]["stages"]["backup_statuses_written_back"] = status
+                if transcript_included:
+                    delivery_results[work_id]["stages"]["feishu_written_back"] = status
+                if not args.dry_run:
+                    state_path = Path(delivery_results[work_id]["_batch"]["state_path"])
+                    state = load_state(state_path, creator, work_by_id[work_id])
+                    set_combined_finalizer_status(
+                        state, transcript_included=transcript_included,
+                        status="success" if success else "failed",
+                        duration_seconds=batch_seconds, detail=str(outcome.get("error") or ""),
+                    )
+                    write_json(state_path, state)
+        except Exception as exc:
+            detail = str(exc)
+            batch_seconds = time.perf_counter() - batch_started
+            logger.write(f"飞书最终结果批量写回失败: {detail}")
+            for work_id in feishu_ids:
+                transcript_included = bool(delivery_results[work_id]["_batch"].get("transcript_file"))
+                delivery_results[work_id]["stages"]["backup_statuses_written_back"] = "failed"
+                if transcript_included:
+                    delivery_results[work_id]["stages"]["feishu_written_back"] = "failed"
+                if not args.dry_run:
+                    state_path = Path(delivery_results[work_id]["_batch"]["state_path"])
+                    state = load_state(state_path, creator, work_by_id[work_id])
+                    set_combined_finalizer_status(
+                        state, transcript_included=transcript_included, status="failed",
+                        duration_seconds=batch_seconds, detail=detail,
+                    )
+                    write_json(state_path, state)
+            if args.fail_fast:
+                raise
+
+    for item in delivery_results.values():
+        item.pop("_batch", None)
+
+
 def process_creator_phase(
     config: dict[str, Any], context: dict[str, Any], runner: Runner,
     logger: Logger, env: dict[str, str], args: argparse.Namespace,
@@ -1446,7 +1690,6 @@ def process_creator_phase(
         logger.write(f"========== 达人结束: {name}，状态 {result['status']} ==========")
         return result
 
-    key = str(context["key"])
     works_file = context["works_file"]
     profile_file = context["profile_file"]
     state_dir = context["state_dir"]
@@ -1456,82 +1699,115 @@ def process_creator_phase(
     collection_ok = bool(context["collection_ok"])
     sync_ok = bool(context["sync_ok"])
     synced_record_ids = context["synced_record_ids"]
-
-    result["backup_mappings"] = sync_creator_backup_mappings(
-        config, creator, profile_file, state_dir, runner, logger, env, args,
-    )
-
-    workers = asr_worker_count(config, args, len(selected))
-    logger.write(f"{name} ASR/文案纠正并发数: {workers}")
-    prepared: dict[str, dict[str, Any]] = {}
     work_by_id = {str(work["aweme_id"]): work for work in selected}
-    if workers == 1:
-        for work in selected:
-            work_id = str(work["aweme_id"])
+    delivery_results: dict[str, dict[str, Any]] = {}
+    args._defer_kuake = True
+    args._defer_feishu_writeback = True
+    args._delivery_breakers = {}
+
+    def failed_preparation(work_id: str, exc: Exception) -> dict[str, Any]:
+        logger.write(f"作品预处理异常 {work_id}: {exc}")
+        return {
+            "aweme_id": work_id,
+            "title": title_of(work_by_id[work_id]),
+            "stages": {"transcribed": "failed", "corrected": "blocked"},
+            "error": str(exc),
+        }
+
+    def sync_mappings_timed() -> tuple[dict[str, str] | None, float, Exception | None]:
+        started = time.perf_counter()
+        try:
+            mappings = sync_creator_backup_mappings(
+                config, creator, profile_file, state_dir, runner, logger, env, args,
+            )
+            return mappings, time.perf_counter() - started, None
+        except Exception as exc:
+            return None, time.perf_counter() - started, exc
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="creator-mapping") as mapping_executor:
+        mapping_future = mapping_executor.submit(sync_mappings_timed)
+        mappings_ready = False
+
+        def wait_for_mappings() -> None:
+            nonlocal mappings_ready
+            if mappings_ready:
+                return
+            mappings, mapping_seconds, mapping_error = mapping_future.result()
+            result.setdefault("phase_timings", {})["backup_mapping_seconds"] = round(mapping_seconds, 3)
+            mappings_ready = True
+            if mapping_error is None:
+                result["backup_mappings"] = mappings or {}
+                return
+            logger.write(f"达人目录映射确认失败 {name}: {mapping_error}")
+            result["backup_mappings"] = {"mapping_sync": "failed"}
+            result["backup_mapping_error"] = str(mapping_error)
+            if getattr(args, "fail_fast", False):
+                raise mapping_error
+
+        def deliver(work_id: str, prepared: dict[str, Any]) -> None:
+            wait_for_mappings()
+            work = work_by_id[work_id]
             try:
-                item = prepare_work(
+                work_result = process_downstream(
                     config, creator, work, works_file, profile_file, state_dir, media_dir,
-                    runner, logger, env, args,
+                    runner, logger, env, args, prepared, synced_record_ids.get(work_id),
                 )
             except Exception as exc:
-                logger.write(f"作品预处理异常 {work_id}: {exc}")
-                item = {
-                    "aweme_id": work_id,
-                    "title": title_of(work),
-                    "stages": {"transcribed": "failed", "corrected": "blocked"},
-                    "error": str(exc),
-                }
-            prepared[work_id] = item
-            if args.fail_fast and "failed" in item["stages"].values():
-                raise PipelineError(f"作品 {work_id} 存在失败阶段。")
-    else:
-        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="asr") as executor:
-            futures = {
-                executor.submit(
-                    prepare_work,
-                    config, creator, work, works_file, profile_file, state_dir, media_dir,
-                    runner, logger, env, args,
-                ): str(work["aweme_id"])
-                for work in selected
-            }
-            for future in as_completed(futures):
-                work_id = futures[future]
+                logger.write(f"Work downstream processing failed {work_id}: {exc}")
+                work_result = dict(prepared)
+                work_result["stages"] = dict(work_result.get("stages", {}))
+                work_result["stages"]["downstream"] = "failed"
+                work_result["error"] = str(exc)
+            delivery_results[work_id] = work_result
+            if getattr(args, "fail_fast", False) and "failed" in work_result["stages"].values():
+                raise PipelineError(f"Work {work_result['aweme_id']} has a failed stage.")
+
+        workers = asr_worker_count(config, args, len(selected))
+        logger.write(f"{name} ASR/文案纠正并发数: {workers}")
+        if workers == 1:
+            for work in selected:
+                work_id = str(work["aweme_id"])
                 try:
-                    item = future.result()
+                    prepared = prepare_work(
+                        config, creator, work, works_file, profile_file, state_dir, media_dir,
+                        runner, logger, env, args,
+                    )
                 except Exception as exc:
-                    logger.write(f"作品预处理异常 {work_id}: {exc}")
-                    item = {
-                        "aweme_id": work_id,
-                        "title": title_of(work_by_id[work_id]),
-                        "stages": {"transcribed": "failed", "corrected": "blocked"},
-                    }
-                prepared[work_id] = item
-                if args.fail_fast and "failed" in item["stages"].values():
-                    for pending in futures:
-                        pending.cancel()
-                    raise PipelineError(f"作品 {work_id} 存在失败阶段。")
+                    prepared = failed_preparation(work_id, exc)
+                deliver(work_id, prepared)
+        else:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="asr") as executor:
+                futures = {
+                    executor.submit(
+                        prepare_work,
+                        config, creator, work, works_file, profile_file, state_dir, media_dir,
+                        runner, logger, env, args,
+                    ): str(work["aweme_id"])
+                    for work in selected
+                }
+                for future in as_completed(futures):
+                    work_id = futures[future]
+                    try:
+                        prepared = future.result()
+                    except Exception as exc:
+                        prepared = failed_preparation(work_id, exc)
+                    try:
+                        deliver(work_id, prepared)
+                    except Exception:
+                        for pending in futures:
+                            pending.cancel()
+                        raise
+        wait_for_mappings()
 
-    # Creator-level mappings and backup destinations are shared resources.
-    # Keep delivery serial while the expensive ASR preparation is parallel.
-    for work in selected:
-        work_id = str(work["aweme_id"])
-        try:
-            work_result = process_downstream(
-                config, creator, work, works_file, profile_file, state_dir, media_dir,
-                runner, logger, env, args, prepared[work_id], synced_record_ids.get(work_id),
-            )
-        except Exception as exc:
-            logger.write(f"Work downstream processing failed {work_id}: {exc}")
-            work_result = dict(prepared[work_id])
-            work_result["stages"] = dict(work_result.get("stages", {}))
-            work_result["stages"]["downstream"] = "failed"
-            work_result["error"] = str(exc)
-        result["works"].append(work_result)
-        if args.fail_fast and "failed" in work_result["stages"].values():
-            raise PipelineError(f"Work {work_result['aweme_id']} has a failed stage.")
-
-    failed_work = any("failed" in item["stages"].values() for item in result["works"])
-    mapping_failed = "failed" in result["backup_mappings"].values()
+    finalize_creator_batches(
+        config, creator, selected, delivery_results, state_dir, runner, logger, env, args,
+    )
+    result["works"] = [delivery_results[str(work["aweme_id"])] for work in selected]
+    failed_work = any(
+        work_has_failed_stage(item["stages"], feishu_only=getattr(args, "feishu_only", False))
+        for item in result["works"]
+    )
+    mapping_failed = "failed" in result.get("backup_mappings", {}).values()
     result["status"] = "partial_failure" if (not collection_ok or not sync_ok or mapping_failed or failed_work) else "success"
     if result["status"] == "success" and not args.dry_run:
         complete_collection_pending(
@@ -1542,7 +1818,6 @@ def process_creator_phase(
     )
     logger.write(f"========== 达人结束: {name}，状态 {result['status']} ==========")
     return result
-
 
 def process_creator_phase_safely(
     config: dict[str, Any], context: dict[str, Any], runner: Runner,
@@ -1604,6 +1879,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-kuake", action="store_true")
     parser.add_argument("--skip-obsidian", action="store_true")
     parser.add_argument(
+        "--feishu-only", action="store_true",
+        help="??????????????????????????????????????",
+    )
+    parser.add_argument(
         "--refresh-mappings", action="store_true",
         help="忽略达人目录映射缓存，重新确认 IMA/夸克/Obsidian 目录并回写飞书",
     )
@@ -1626,6 +1905,10 @@ def main(argv: list[str] | None = None) -> int:
     config: dict[str, Any] | None = None
     runner: Runner | None = None
     args = build_parser().parse_args(argv)
+    if args.feishu_only:
+        args.skip_collect = True
+        args.skip_transcribe = True
+        args.skip_correction = True
     try:
         config_path = path_from(args.config)
         if config_path is None:

@@ -305,6 +305,41 @@ def cmd_upload(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_upload_manifest(args: argparse.Namespace) -> int:
+    payload = load_json(args.manifest)
+    items = payload.get("files") if isinstance(payload, dict) else None
+    if not isinstance(items, list) or not items:
+        raise KuakeBackupError("批量上传清单缺少非空 files 数组")
+    credentials, default_backup_dir = load_credentials(args.local_env)
+    base_dir = args.base_dir or default_backup_dir
+    creator_name = args.creator_name or str(payload.get("creator_name") or "")
+    remote_dir = args.remote_dir or str(payload.get("remote_dir") or "")
+    if not remote_dir:
+        remote_dir = join_remote_path(base_dir, sanitize_path_part(creator_name)) if creator_name else base_dir
+    directory = ensure_dir_details(args.kuake_exe, credentials, remote_dir)
+    results: dict[str, dict[str, Any]] = {}
+    for item in items:
+        work_id = str(item.get("aweme_id") or item.get("video_id") or "").strip()
+        try:
+            if not work_id:
+                raise KuakeBackupError("清单项缺少 aweme_id")
+            local_file = Path(str(item.get("path") or item.get("file") or ""))
+            if not local_file.is_file():
+                raise KuakeBackupError(f"文案文件不存在: {local_file}")
+            remote_name = str(item.get("remote_name") or "").strip() or build_transcript_filename(
+                str(item.get("video_date") or ""), work_id, str(item.get("title") or "未命名"),
+            )
+            remote_path = upload_file(
+                args.kuake_exe, credentials, local_file,
+                remote_dir=directory.path, remote_name=remote_name, create_dir=False,
+            )
+            results[work_id] = {"status": "success", "remote_path": remote_path}
+        except Exception as exc:
+            results[work_id or f"item_{len(results) + 1}"] = {"status": "failed", "error": str(exc)}
+    print(json.dumps({"directory": directory.path, "results": results}, ensure_ascii=False))
+    return 0
+
+
 def cmd_upload_dir(args: argparse.Namespace) -> int:
     credentials, default_backup_dir = load_credentials(args.local_env)
     base_dir = args.base_dir or default_backup_dir
@@ -366,6 +401,13 @@ def build_parser() -> argparse.ArgumentParser:
     upload_parser.add_argument("--create-dir", action="store_true", help="目标目录不存在时自动创建")
     upload_parser.add_argument("--metadata-output", type=Path)
     upload_parser.set_defaults(func=cmd_upload)
+
+    manifest_parser = subparsers.add_parser("upload-manifest", help="按达人清单批量上传 TXT 文案")
+    manifest_parser.add_argument("--manifest", type=Path, required=True)
+    manifest_parser.add_argument("--base-dir", default="")
+    manifest_parser.add_argument("--creator-name", default="")
+    manifest_parser.add_argument("--remote-dir", default="")
+    manifest_parser.set_defaults(func=cmd_upload_manifest)
 
     upload_dir_parser = subparsers.add_parser("upload-dir", help="上传目录中的 TXT 文案")
     upload_dir_parser.add_argument("--input-dir", type=Path, required=True)

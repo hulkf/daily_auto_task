@@ -17,6 +17,171 @@ SPEC.loader.exec_module(PIPELINE)
 
 
 class PipelineHelpersTest(unittest.TestCase):
+    def test_feishu_only_status_ignores_reported_backup_failures(self):
+        stages = {
+            "feishu_written_back": "success",
+            "backup_statuses_written_back": "success",
+            "ima_backed_up": "failed",
+            "kuake_backed_up": "skipped",
+            "obsidian_exported": "skipped",
+        }
+        self.assertFalse(PIPELINE.work_has_failed_stage(stages, feishu_only=True))
+        self.assertTrue(PIPELINE.work_has_failed_stage(stages, feishu_only=False))
+
+    def test_feishu_only_status_still_fails_when_feishu_writeback_fails(self):
+        stages = {
+            "feishu_written_back": "failed",
+            "backup_statuses_written_back": "success",
+            "ima_backed_up": "skipped",
+        }
+        self.assertTrue(PIPELINE.work_has_failed_stage(stages, feishu_only=True))
+
+    def test_permanent_delivery_error_opens_creator_target_circuit_breaker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            creator = {"key": "a", "creator_name": "达人 A"}
+            args = argparse.Namespace(
+                dry_run=False, skip_feishu_writeback=True, skip_ima=False, skip_kuake=True,
+                skip_obsidian=True, feishu_only=False, resume=False, force_stage=set(),
+                overwrite=False, backup_workers=1, fail_fast=False, _delivery_breakers={},
+            )
+            runner = Mock()
+            runner.run.side_effect = PIPELINE.PipelineError("IMA 凭证无效")
+            for work_id in ("1", "2"):
+                work = {"aweme_id": work_id}
+                paths = PIPELINE.artifact_paths(root / "media", work_id, "volcengine")
+                paths["final"].parent.mkdir(parents=True, exist_ok=True)
+                paths["final"].write_text("文案", encoding="utf-8")
+                result = PIPELINE.process_downstream(
+                    {"ima": {"enabled": True}}, creator, work, root / "works.json", None,
+                    root / "state", root / "media", runner,
+                    PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+                    {"aweme_id": work_id, "title": "ok", "stages": {"corrected": "success"}},
+                )
+                self.assertEqual(result["stages"]["ima_backed_up"], "failed")
+            self.assertEqual(runner.run.call_count, 1)
+            self.assertIn("ima_backed_up", args._delivery_breakers)
+
+    def test_creator_batch_finalizer_calls_quark_and_feishu_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            creator = {"key": "a", "creator_name": "达人 A", "works_table_id": "tbl1"}
+            selected = [{"aweme_id": "1", "create_time": 1}, {"aweme_id": "2", "create_time": 2}]
+            delivery_results = {}
+            for work in selected:
+                work_id = work["aweme_id"]
+                final_file = root / f"{work_id}.txt"
+                final_file.write_text("文案", encoding="utf-8")
+                delivery_results[work_id] = {
+                    "aweme_id": work_id,
+                    "stages": {
+                        "ima_backed_up": "success", "kuake_backed_up": "pending",
+                        "obsidian_exported": "success", "feishu_written_back": "pending",
+                        "backup_statuses_written_back": "pending",
+                    },
+                    "_batch": {
+                        "state_path": str(root / "state" / "a" / f"{work_id}.json"),
+                        "transcript_file": str(final_file), "record_id": f"rec{work_id}",
+                    },
+                }
+            runner = Mock()
+            runner.run.side_effect = [
+                json.dumps({"results": {"1": {"status": "success"}, "2": {"status": "success"}}}),
+                json.dumps({"results": {"1": {"status": "success"}, "2": {"status": "failed", "error": "row locked"}}}),
+            ]
+            args = argparse.Namespace(dry_run=False, fail_fast=False)
+
+            PIPELINE.finalize_creator_batches(
+                {}, creator, selected, delivery_results, root / "state", runner,
+                PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+            )
+
+            self.assertEqual(runner.run.call_count, 2)
+            self.assertIn("upload-manifest", runner.run.call_args_list[0].args[1])
+            self.assertIn("--manifest", runner.run.call_args_list[1].args[1])
+            self.assertEqual(delivery_results["1"]["stages"]["backup_statuses_written_back"], "success")
+            self.assertEqual(delivery_results["2"]["stages"]["backup_statuses_written_back"], "failed")
+            self.assertNotIn("_batch", delivery_results["1"])
+
+    def test_creator_mapping_confirmation_overlaps_asr_preparation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            creator = {"key": "a", "creator_name": "达人 A"}
+            work = {"aweme_id": "1"}
+            context = {
+                "creator": creator, "key": "a", "name": "达人 A",
+                "works_file": root / "works.json", "profile_file": None,
+                "state_dir": root / "state", "media_dir": root / "media",
+                "collection_state_file": root / "collection.json",
+                "result": {"key": "a", "works": [], "phase_timings": {}},
+                "selected": [work], "collection_ok": True, "sync_ok": True,
+                "synced_record_ids": {}, "terminal": False,
+            }
+            args = argparse.Namespace(asr_workers=1, fail_fast=False, dry_run=True)
+            mapping_started = threading.Event()
+            preparation_started = threading.Event()
+
+            def mappings(*unused):
+                mapping_started.set()
+                self.assertTrue(preparation_started.wait(2), "目录映射确认阻塞了 ASR")
+                return {"ima": "success", "kuake": "success", "obsidian": "success"}
+
+            def prepare(*unused):
+                preparation_started.set()
+                self.assertTrue(mapping_started.wait(2), "ASR 未与目录映射确认同时启动")
+                return {"aweme_id": "1", "title": "ok", "stages": {"transcribed": "success", "corrected": "success"}}
+
+            with patch.object(PIPELINE, "sync_creator_backup_mappings", side_effect=mappings), patch.object(
+                PIPELINE, "prepare_work", side_effect=prepare,
+            ), patch.object(PIPELINE, "process_downstream", side_effect=lambda *values: values[-2]):
+                result = PIPELINE.process_creator_phase(
+                    {}, context, Mock(), PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+                )
+
+            self.assertEqual(result["works"][0]["aweme_id"], "1")
+
+    def test_creator_delivers_in_asr_completion_order_but_reports_selected_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            creator = {"key": "a", "creator_name": "达人 A"}
+            works = [{"aweme_id": "1"}, {"aweme_id": "2"}]
+            context = {
+                "creator": creator, "key": "a", "name": "达人 A",
+                "works_file": root / "works.json", "profile_file": None,
+                "state_dir": root / "state", "media_dir": root / "media",
+                "collection_state_file": root / "collection.json",
+                "result": {"key": "a", "works": [], "phase_timings": {}},
+                "selected": works, "collection_ok": True, "sync_ok": True,
+                "synced_record_ids": {}, "terminal": False,
+            }
+            args = argparse.Namespace(asr_workers=2, fail_fast=False, dry_run=True)
+            release_first = threading.Event()
+            second_delivered = threading.Event()
+            delivered: list[str] = []
+
+            def prepare(config, creator, work, *unused):
+                if work["aweme_id"] == "1":
+                    self.assertTrue(release_first.wait(2), "第一条作品过早完成")
+                return {"aweme_id": work["aweme_id"], "title": "ok", "stages": {"transcribed": "success", "corrected": "success"}}
+
+            def deliver(config, creator, work, *values):
+                delivered.append(work["aweme_id"])
+                if work["aweme_id"] == "2":
+                    second_delivered.set()
+                    release_first.set()
+                return values[-2]
+
+            with patch.object(PIPELINE, "sync_creator_backup_mappings", return_value={}), patch.object(
+                PIPELINE, "prepare_work", side_effect=prepare,
+            ), patch.object(PIPELINE, "process_downstream", side_effect=deliver):
+                result = PIPELINE.process_creator_phase(
+                    {}, context, Mock(), PIPELINE.Logger(root / "log.txt", persist=False), {}, args,
+                )
+
+            self.assertTrue(second_delivered.is_set())
+            self.assertEqual(delivered, ["2", "1"])
+            self.assertEqual([item["aweme_id"] for item in result["works"]], ["1", "2"])
+
     def test_main_overlaps_next_creator_collection_with_previous_creator_processing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -638,6 +803,65 @@ class PipelineHelpersTest(unittest.TestCase):
     def test_parser_accepts_backfill_existing(self):
         args = PIPELINE.build_parser().parse_args(["--backfill-existing"])
         self.assertTrue(args.backfill_existing)
+
+    def test_parser_accepts_feishu_only(self):
+        args = PIPELINE.build_parser().parse_args(["--feishu-only"])
+        self.assertTrue(args.feishu_only)
+
+    def test_feishu_only_preserves_persisted_backup_statuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media_dir = root / "media"
+            state_dir = root / "state"
+            work = {"aweme_id": "123", "create_time": 1}
+            creator = {"key": "demo", "creator_name": "??", "works_table_id": "tbl-demo"}
+            paths = PIPELINE.artifact_paths(media_dir, "123", "volcengine")
+            paths["final"].parent.mkdir(parents=True, exist_ok=True)
+            paths["final"].write_text("????", encoding="utf-8")
+            state_path = state_dir / "demo" / "123.json"
+            state = PIPELINE.load_state(state_path, creator, work)
+            PIPELINE.set_status(state, "ima_backed_up", "failed", "????")
+            PIPELINE.set_status(state, "kuake_backed_up", "success")
+            PIPELINE.set_status(state, "obsidian_exported", "success")
+            PIPELINE.write_json(state_path, state)
+            args = argparse.Namespace(
+                dry_run=False, skip_feishu_writeback=False, skip_ima=False, skip_kuake=False,
+                skip_obsidian=False, feishu_only=True, resume=True, force_stage=set(),
+                fail_fast=False, overwrite=False, backup_workers=1,
+            )
+            runner = Mock()
+            result = PIPELINE.process_downstream(
+                {"asr": {"provider": "volcengine"}}, creator, work, root / "works.json",
+                None, state_dir, media_dir, runner, PIPELINE.Logger(root / "log.txt", persist=False),
+                {}, args, {"aweme_id": "123", "title": "title", "stages": {"corrected": "disabled"}},
+            )
+            command = runner.run.call_args.args[1]
+            self.assertEqual(result["stages"]["ima_backed_up"], "failed")
+            self.assertEqual(result["stages"]["kuake_backed_up"], "skipped")
+            self.assertEqual(result["stages"]["obsidian_exported"], "skipped")
+            self.assertEqual(command[command.index("--ima-status") + 1], "\u5931\u8d25")
+            self.assertEqual(command[command.index("--kuake-status") + 1], "\u5df2\u4e0a\u4f20")
+            self.assertEqual(command[command.index("--local-status") + 1], "\u5df2\u5199\u5165")
+
+    def test_disabled_feishu_mapping_marker_is_not_fresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            metadata = root / "ima.json"
+            metadata.write_text(json.dumps({
+                "platform": "ima",
+                "directory": {"name": "??", "path": "/??"},
+                "feishu_fields": {"IMA??": "/??"},
+            }, ensure_ascii=False), encoding="utf-8")
+            marker = root / "feishu-sync.json"
+            marker.write_text(json.dumps({
+                "creator_key": "demo",
+                "signature": PIPELINE.mapping_cache_signature([metadata]),
+                "feishu_writeback": "disabled",
+            }), encoding="utf-8")
+            self.assertFalse(PIPELINE.mapping_cache_is_fresh(
+                [metadata], 24, marker_path=marker,
+                expected_creator_name={"ima": "??"}, expected_creator_key="demo",
+            ))
 
 
 if __name__ == "__main__":

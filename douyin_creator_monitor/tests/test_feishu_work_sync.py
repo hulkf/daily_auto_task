@@ -142,6 +142,73 @@ class FeishuWorkSyncTest(unittest.TestCase):
         self.assertIn("+record-get", mocked.call_args_list[1].args[1])
         self.assertEqual(result["verified"], 1)
 
+    def test_create_batches_limits_json_size_and_preserves_order(self):
+        items = [
+            {
+                "work_id": str(index),
+                "patch": {"抖音作品ID": str(index), "原始作品数据": "x" * 8_000},
+            }
+            for index in range(5)
+        ]
+
+        batches = SYNC.create_batches(items)
+
+        self.assertGreater(len(batches), 1)
+        self.assertEqual(
+            [item["work_id"] for batch, _ in batches for item in batch],
+            [str(index) for index in range(5)],
+        )
+        self.assertTrue(all(len(batch) <= SYNC.MAX_BATCH_CREATE_RECORDS for batch, _ in batches))
+        self.assertTrue(all(len(payload) <= SYNC.MAX_BATCH_CREATE_JSON_CHARS for _, payload in batches))
+
+    def test_sync_splits_large_creates_and_maps_record_ids_in_work_order(self):
+        works = [
+            {
+                "aweme_id": str(index),
+                "desc": "long transcript " + "x" * 7_000,
+                "create_time": index + 1,
+                "digg_count": index,
+                "comment_count": index,
+                "collect_count": index,
+                "share_count": index,
+            }
+            for index in range(4)
+        ]
+        create_payloads = []
+
+        def fake_run_lark(cli, command):
+            self.assertIn("+record-batch-create", command)
+            payload_text = command[command.index("--json") + 1]
+            self.assertLessEqual(len(payload_text), SYNC.MAX_BATCH_CREATE_JSON_CHARS)
+            payload = json.loads(payload_text)
+            create_payloads.append(payload)
+            work_id_index = payload["fields"].index("抖音作品ID")
+            work_ids = [str(row[work_id_index]) for row in payload["rows"]]
+            return {"data": {"record_id_list": [f"rec-{work_id}" for work_id in work_ids]}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            works_file = Path(directory) / "works.json"
+            works_file.write_text(json.dumps({"works": works}, ensure_ascii=False), encoding="utf-8")
+            args = argparse.Namespace(
+                base_token="token", works_file=str(works_file), skip_schema_validation=True,
+                lark_cli="cli", table_id="table", dry_run=False,
+            )
+            with patch.object(SYNC, "load_existing_records", return_value={}), patch.object(
+                SYNC, "run_lark", side_effect=fake_run_lark,
+            ), patch.object(SYNC, "verify_written_records", return_value=len(works)):
+                result = SYNC.sync(args)
+
+        self.assertGreater(len(create_payloads), 1)
+        self.assertEqual(
+            result["record_ids"],
+            {str(index): f"rec-{index}" for index in range(4)},
+        )
+        self.assertEqual(
+            [action["work_id"] for action in result["actions"]],
+            [str(index) for index in range(4)],
+        )
+        self.assertEqual(result["verified"], len(works))
+
     def test_unchanged_rows_refresh_recent_collection_time_in_one_batch(self):
         work = {
             "aweme_id": "same", "desc": "相同", "create_time": 1,

@@ -65,6 +65,9 @@ class SafeBackupPathTest(unittest.TestCase):
                     "ima_backed_up": {"status": "success"},
                     "kuake_backed_up": {"status": "success"},
                     "obsidian_exported": {"status": "success"},
+                    "feishu_synced": {"status": "success"},
+                    "feishu_written_back": {"status": "success"},
+                    "backup_statuses_written_back": {"status": "success"},
                 }}),
                 encoding="utf-8",
             )

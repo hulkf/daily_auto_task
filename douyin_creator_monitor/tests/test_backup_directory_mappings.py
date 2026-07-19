@@ -110,6 +110,23 @@ class FeishuMappingPatchTest(unittest.TestCase):
             )
         self.assertEqual(record_id, "rec_aligc")
 
+    def test_long_secuid_skips_keyword_search_limit(self):
+        secuid = "MS4wLjABAAAA" + "x" * 45
+        response = {
+            "ok": True,
+            "data": {
+                "data": [[secuid]],
+                "record_id_list": ["rec_long"],
+                "has_more": False,
+            },
+        }
+        with patch.object(SYNC, "run_lark", return_value=response) as mocked:
+            record_id = SYNC.search_creator_record("cli", "token", "table", "SecUID", secuid, "user")
+        self.assertEqual(record_id, "rec_long")
+        args = mocked.call_args.args[1]
+        self.assertIn("+record-list", args)
+        self.assertNotIn("+record-search", args)
+
     def test_creator_search_fallback_paginates_beyond_200_rows(self):
         responses = [
             {"ok": True, "data": {"data": [], "record_id_list": []}},

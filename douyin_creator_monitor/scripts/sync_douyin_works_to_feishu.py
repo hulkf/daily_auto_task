@@ -35,6 +35,9 @@ SYNC_COMPARE_FIELDS = (
 )
 CORE_VERIFY_FIELDS = ("抖音作品ID", "发布时间", "点赞数", "评论数", "收藏数", "分享数")
 
+MAX_BATCH_CREATE_RECORDS = 200
+MAX_BATCH_CREATE_JSON_CHARS = 20_000
+
 
 def run_lark(cli: str, args: list[str]) -> dict[str, Any]:
     env = os.environ.copy()
@@ -242,6 +245,35 @@ def batch_create_payload(items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def create_batches(
+    items: list[dict[str, Any]],
+    *,
+    maximum_records: int = MAX_BATCH_CREATE_RECORDS,
+    maximum_json_chars: int = MAX_BATCH_CREATE_JSON_CHARS,
+) -> list[tuple[list[dict[str, Any]], str]]:
+    """Split creates by both API row count and Windows command-line payload size."""
+    if maximum_records < 1 or maximum_json_chars < 1:
+        raise ValueError("Batch limits must be positive")
+
+    batches: list[tuple[list[dict[str, Any]], str]] = []
+    current: list[dict[str, Any]] = []
+    current_json = ""
+    for item in items:
+        candidate = [*current, item]
+        candidate_json = json.dumps(batch_create_payload(candidate), ensure_ascii=False)
+        exceeds_limit = len(candidate) > maximum_records or len(candidate_json) > maximum_json_chars
+        if current and exceeds_limit:
+            batches.append((current, current_json))
+            current = [item]
+            current_json = json.dumps(batch_create_payload(current), ensure_ascii=False)
+        else:
+            current = candidate
+            current_json = candidate_json
+    if current:
+        batches.append((current, current_json))
+    return batches
+
+
 def extract_record_ids(payload: Any) -> list[str]:
     found: list[str] = []
     if isinstance(payload, dict):
@@ -366,14 +398,13 @@ def sync(args: argparse.Namespace) -> dict[str, Any]:
     if args.dry_run:
         actions.extend({"work_id": item["work_id"], "action": "create"} for item in plan["create"])
     else:
-        for start in range(0, len(plan["create"]), 200):
-            batch = plan["create"][start:start + 200]
+        for batch, batch_json in create_batches(plan["create"]):
             response = run_lark(
                 args.lark_cli,
                 [
                     "base", "+record-batch-create", "--base-token", base_token,
                     "--table-id", args.table_id,
-                    "--json", json.dumps(batch_create_payload(batch), ensure_ascii=False),
+                    "--json", batch_json,
                     "--format", "json", "--as", "user",
                 ],
             )

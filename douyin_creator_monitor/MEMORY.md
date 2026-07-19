@@ -31,7 +31,7 @@ Automatic approval review failed: We're currently experiencing high demand
 python douyin_creator_monitor\scripts\run_three_creator_backfill.py
 ```
 
-该入口负责知了、糯米爸、阿笠的断点续跑，并在一个父进程中调用抓取、ASR、文案纠正、IMA、夸克和 Obsidian 子流程；飞书阶段保持跳过。
+该入口负责知了、糯米爸、阿笠的断点续跑，并在一个父进程中调用抓取、飞书基础同步、ASR、文案纠正、IMA、夸克、Obsidian、飞书文案/状态回写和达人目录映射子流程；飞书阶段不得跳过。
 
 #### 2. 批准前缀不等于命令已经自动脱离沙箱
 
@@ -88,7 +88,7 @@ python douyin_creator_monitor\scripts\run_three_creator_backfill.py
 - 只选择缺少最终文案或缺少已启用备份状态的作品；
 - 失败作品最多重试有限次数，不能挡住更老的待处理作品；
 - 延长火山 ASR 查询等待时间，减少任务实际成功但轮询过早超时；
-- 跳过飞书同步和飞书回写；
+- 飞书基础同步、最终文案、三处备份状态与达人目录映射必须回写；
 - 继续执行 IMA、夸克和 Obsidian；
 - 父进程输出必须兼容 Windows GBK 控制台；
 - 全程保留日志和断点，可在重启后继续。
@@ -132,7 +132,7 @@ python douyin_creator_monitor\scripts\run_three_creator_backfill.py
 - 夸克可正常上传；
 - Obsidian 外部目录 `D:\software\Obsidian\ljr_data\ljr_data\Z_Original` 可正常创建和写入文件；
 - 不再出现 `[WinError 10013]` 或 Obsidian `Permission denied`；
-- 飞书继续按用户要求跳过。
+- 当时该轮仍跳过飞书；该做法已在后续飞书全量补写中废止，以下方最新规则为准。
 
 这说明此前反复失败确实来自 Codex 沙箱/审批层，而不是项目脚本或 Obsidian 本身。以后在相同权限上下文中：
 
@@ -143,3 +143,32 @@ python douyin_creator_monitor\scripts\run_three_creator_backfill.py
 5. 单条作品的下游备份异常必须记录后继续处理下一条，不能中断整位博主。
 
 本轮最终业务状态：知了 43/43、糯米爸 97/97、阿笠 155/155 均已有非空最终文案，并已完成夸克和 Obsidian；IMA 已完成知了 43、糯米爸 95、阿笠 61，其余因 2026-07-19 当日请求额度耗尽留待下一自然日断点续传。
+
+## 2026-07-19 22:31-23:02：三位博主飞书全量补写完成
+
+### 最新且优先的规则
+
+1. 飞书不能跳过。三位博主的作品基础数据、最终文案、IMA/夸克/Obsidian 实际状态和达人备份目录映射都必须正常写入。
+2. 本地作品、文案和备份已完成而飞书缺失时，使用 `run_creator_pipeline.py --creator <key> --feishu-only`；该模式不重新抓取、不重新 ASR、不重复上传三处备份。
+3. `run_three_creator_backfill.py` 不得再自动附加 `--skip-feishu-sync` 或 `--skip-feishu-writeback`，待处理判断必须包含飞书同步、文案回写和备份状态回写。
+4. 飞书状态必须反映本地真实结果：成功写“已上传/已写入”，失败写“失败”，禁用写“跳过”，不得虚报。
+5. IMA 在 2026-07-19 返回 `HTTP 403 / code 200005 / 请求超量，请明日再试`，属于当日服务额度，不是权限问题；当天不要重复上传失败项。
+
+### 本轮修复
+
+- 飞书批量创建不能只按 200 条分批。Windows `CreateProcess` 会因巨大 `--json` 参数触发 `[WinError 206]`；现在同时限制每批最多 200 条、JSON 最多 20,000 字符，并保持返回 `record_id` 与作品顺序一致。
+- 抖音 SecUID 可能超过飞书 CLI 关键词搜索的 50 字符限制；长 SecUID 必须改用 `record-list` 分页后精确匹配。
+- 历史达人目录映射 marker 若记录 `feishu_writeback=disabled`，不得视为已完成缓存。
+- `--feishu-only` 的进程状态只由飞书相关操作决定；本地 IMA 失败仍如实回写，但不再导致飞书补写任务误报失败。
+
+### 实际核对结果
+
+- 知了：本地 43 条全部存在于飞书，43 条最终文案非空；IMA 43 已上传，夸克 43 已上传，Obsidian 43 已写入。飞书另保留 1 条不在当前本地文件中的历史记录，按非破坏性同步规则不删除。
+- 糯米爸：本地 97 条全部存在于飞书，97 条最终文案非空；IMA 95 已上传、2 跳过，夸克 97 已上传，Obsidian 97 已写入。
+- 阿笠：本地 155 条全部存在于飞书，155 条最终文案非空；IMA 61 已上传、90 失败、4 跳过，夸克 155 已上传，Obsidian 155 已写入。表中另有 1 条空 ID 行，不属于作品记录，按非破坏性同步规则不自动删除。
+- 三张作品表对本地作品 ID 均无缺失、无重复；三位达人目录映射均已写入并生成 `runtime/pipeline/mappings/<creator>/feishu-sync.json` 成功 marker。
+- 阿笠本轮基础同步：原有 10 条，新增 145 条，更新 4 条，跳过 6 条，回读校验 149 条成功；随后 155 条最终文案和备份状态全部回写成功。
+- 自动化测试共 85 项，全部通过。
+## 2026-07-19 性能优化决策
+
+主流水线采用“双流水线 + 达人级批量收口”：目录映射与 ASR 并行，ASR 完成一条即按完成顺序进入单消费者执行 IMA/本地知识库等可即时交付环节；夸克在达人级用 manifest 批量上传，随后飞书最终结果按达人批量写回。永久错误熔断仅在当前达人、当前交付目标内生效，不跨达人继承；超时、429、5xx、DNS 等临时错误不熔断。最终结果仍按原作品顺序汇总，确保报告稳定和断点状态可追踪。

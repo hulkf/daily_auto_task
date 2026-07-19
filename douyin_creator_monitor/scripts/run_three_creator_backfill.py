@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Resumable historical backfill for the three configured Douyin creators.
 
-This fixed entrypoint is intentionally suitable for one scoped Codex approval
-or Windows Task Scheduler. It skips every Feishu stage while keeping ASR,
-correction, IMA, Kuake, and Obsidian enabled. Completed full-history collection
-markers are honored, so restarts do not crawl all creator pages again.
+This fixed entrypoint is intentionally suitable for Windows Task Scheduler.
+It keeps Feishu work sync, transcript/status writeback, ASR, correction, IMA,
+Kuake, and Obsidian enabled. Completed full-history collection markers are
+honored, so restarts do not crawl all creator pages again.
 """
 
 from __future__ import annotations
@@ -95,6 +95,7 @@ def pending_works(config: dict[str, Any], creator: str) -> list[dict[str, Any]]:
         stage for section_name, stage in REQUIRED_BACKUPS
         if bool(config.get(section_name, {}).get("enabled", True))
     ]
+    required_stages.extend(("feishu_synced", "feishu_written_back", "backup_statuses_written_back"))
 
     pending: list[dict[str, Any]] = []
     for work in works:
@@ -149,8 +150,6 @@ def run_batch(
         "--creator", creator,
         "--backfill-existing",
         "--max-works", str(BATCH_SIZE),
-        "--skip-feishu-sync",
-        "--skip-feishu-writeback",
         "--asr-workers", str(ASR_WORKERS),
         "--backup-workers", str(BACKUP_WORKERS),
     ]
