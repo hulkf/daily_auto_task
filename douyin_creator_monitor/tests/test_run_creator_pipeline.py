@@ -288,6 +288,74 @@ class PipelineHelpersTest(unittest.TestCase):
             self.assertLess(events.index("collect:b"), events.index("process:a:end"))
             self.assertLess(events.index("process:a:end"), events.index("process:b:start"))
 
+    def test_main_collects_three_creators_concurrently_and_serially_retries_only_failures(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "pipeline.json"
+            config_path.write_text(
+                json.dumps({
+                    "state_dir": str(root / "state"),
+                    "log_dir": str(root / "logs"),
+                    "creators": [{"key": "a"}, {"key": "b"}, {"key": "c"}],
+                }),
+                encoding="utf-8",
+            )
+            attempts = {"a": 0, "b": 0, "c": 0}
+            collection_lock = threading.Lock()
+            all_initial_started = threading.Event()
+            active_collections = 0
+            max_active_collections = 0
+            retry_active_snapshots = []
+            active_processing = 0
+            max_active_processing = 0
+            processing_lock = threading.Lock()
+            output = []
+
+            def collect_phase(config, creator, runner, logger, env, args):
+                nonlocal active_collections, max_active_collections
+                key = creator["key"]
+                with collection_lock:
+                    attempts[key] += 1
+                    attempt = attempts[key]
+                    if attempt == 1:
+                        active_collections += 1
+                        max_active_collections = max(max_active_collections, active_collections)
+                        if active_collections == 3:
+                            all_initial_started.set()
+                    else:
+                        retry_active_snapshots.append(active_collections)
+                if attempt == 1:
+                    all_initial_started.wait(1)
+                    with collection_lock:
+                        active_collections -= 1
+                    if key == "b":
+                        raise RuntimeError("parallel browser conflict")
+                return {"creator": creator, "result": {"key": key, "works": []}}
+
+            def process_phase(config, context, runner, logger, env, args):
+                nonlocal active_processing, max_active_processing
+                with processing_lock:
+                    active_processing += 1
+                    max_active_processing = max(max_active_processing, active_processing)
+                threading.Event().wait(0.02)
+                with processing_lock:
+                    active_processing -= 1
+                return {"key": context["creator"]["key"], "status": "success", "works": []}
+
+            with patch.object(PIPELINE, "collect_creator_phase", side_effect=collect_phase), patch.object(
+                PIPELINE, "process_creator_phase", side_effect=process_phase,
+            ), patch.object(PIPELINE, "print_console", side_effect=lambda value, **kwargs: output.append(str(value))):
+                exit_code = PIPELINE.main(["--config", str(config_path), "--dry-run"])
+
+            summary = json.loads(output[-1])
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(max_active_collections, 3)
+            self.assertEqual(attempts, {"a": 1, "b": 2, "c": 1})
+            self.assertEqual(retry_active_snapshots, [0])
+            self.assertEqual(max_active_processing, 1)
+            self.assertEqual([item["key"] for item in summary["creators"]], ["a", "b", "c"])
+            self.assertTrue(all(item["status"] == "success" for item in summary["creators"]))
+
     def test_processing_failure_is_recorded_and_releases_next_creator(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -361,12 +429,128 @@ class PipelineHelpersTest(unittest.TestCase):
 
             summary = json.loads(output[-1])
             self.assertEqual(exit_code, 1)
-            self.assertEqual(collected, ["a", "b"])
+            self.assertCountEqual(collected, ["a", "a", "b"])
             self.assertEqual(processed, ["b"])
             self.assertEqual(summary["creators"][0]["status"], "failed")
+            self.assertEqual(summary["creators"][0]["collection_attempts"], 2)
+            self.assertTrue(summary["creators"][0]["fallback_to_serial"])
             self.assertIn("collector unavailable", summary["creators"][0]["error"])
             self.assertIn("collection_and_sync_seconds", summary["creators"][0]["phase_timings"])
+            self.assertIn("serial_retry_seconds", summary["creators"][0]["phase_timings"])
             self.assertEqual(summary["creators"][1]["status"], "success")
+
+    def test_collection_partial_failure_result_is_serially_retried_before_processing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "pipeline.json"
+            config_path.write_text(
+                json.dumps({
+                    "state_dir": str(root / "state"),
+                    "log_dir": str(root / "logs"),
+                    "creators": [{"key": "a"}, {"key": "b"}],
+                }),
+                encoding="utf-8",
+            )
+            attempts = {"a": 0, "b": 0}
+            processed: list[str] = []
+            output: list[str] = []
+
+            def collect_phase(config, creator, runner, logger, env, args):
+                key = creator["key"]
+                attempts[key] += 1
+                if key == "a" and attempts[key] == 1:
+                    return {
+                        "creator": creator,
+                        "result": {
+                            "key": key,
+                            "status": "partial_failure",
+                            "collection_error": "collector unavailable",
+                            "works": [],
+                        },
+                        "terminal": True,
+                    }
+                return {"creator": creator, "result": {"key": key, "works": []}}
+
+            def process_phase(config, context, runner, logger, env, args):
+                result = context["result"]
+                key = context["creator"]["key"]
+                processed.append(key)
+                result["status"] = "success"
+                return result
+
+            with patch.object(PIPELINE, "collect_creator_phase", side_effect=collect_phase), patch.object(
+                PIPELINE, "process_creator_phase", side_effect=process_phase,
+            ), patch.object(PIPELINE, "print_console", side_effect=lambda value, **kwargs: output.append(str(value))):
+                exit_code = PIPELINE.main(["--config", str(config_path), "--dry-run"])
+
+            summary = json.loads(output[-1])
+            creator_a = summary["creators"][0]
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(attempts, {"a": 2, "b": 1})
+            self.assertCountEqual(processed, ["a", "b"])
+            self.assertEqual(creator_a["collection_attempts"], 2)
+            self.assertTrue(creator_a["fallback_to_serial"])
+            self.assertEqual(creator_a["parallel_collection_error"], "collector unavailable")
+            self.assertIn("parallel_collection_seconds", creator_a["phase_timings"])
+            self.assertIn("serial_retry_seconds", creator_a["phase_timings"])
+
+    def test_collection_partial_failure_retry_is_recorded_without_processing_creator(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "pipeline.json"
+            config_path.write_text(
+                json.dumps({
+                    "state_dir": str(root / "state"),
+                    "log_dir": str(root / "logs"),
+                    "creators": [{"key": "a"}, {"key": "b"}],
+                }),
+                encoding="utf-8",
+            )
+            attempts = {"a": 0, "b": 0}
+            processed: list[str] = []
+            output: list[str] = []
+
+            def collect_phase(config, creator, runner, logger, env, args):
+                key = creator["key"]
+                attempts[key] += 1
+                if key == "a":
+                    error = "parallel failure" if attempts[key] == 1 else "serial retry failure"
+                    return {
+                        "creator": creator,
+                        "result": {
+                            "key": key,
+                            "status": "partial_failure",
+                            "collection_error": error,
+                            "works": [],
+                        },
+                        "terminal": True,
+                    }
+                return {"creator": creator, "result": {"key": key, "works": []}}
+
+            def process_phase(config, context, runner, logger, env, args):
+                result = context["result"]
+                key = context["creator"]["key"]
+                processed.append(key)
+                result["status"] = "success"
+                return result
+
+            with patch.object(PIPELINE, "collect_creator_phase", side_effect=collect_phase), patch.object(
+                PIPELINE, "process_creator_phase", side_effect=process_phase,
+            ), patch.object(PIPELINE, "print_console", side_effect=lambda value, **kwargs: output.append(str(value))):
+                exit_code = PIPELINE.main(["--config", str(config_path), "--dry-run"])
+
+            summary = json.loads(output[-1])
+            creator_a = summary["creators"][0]
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(attempts, {"a": 2, "b": 1})
+            self.assertEqual(processed, ["b"])
+            self.assertEqual(creator_a["status"], "partial_failure")
+            self.assertEqual(creator_a["collection_error"], "serial retry failure")
+            self.assertEqual(creator_a["parallel_collection_error"], "parallel failure")
+            self.assertEqual(creator_a["collection_attempts"], 2)
+            self.assertTrue(creator_a["fallback_to_serial"])
+            self.assertIn("parallel_collection_seconds", creator_a["phase_timings"])
+            self.assertIn("serial_retry_seconds", creator_a["phase_timings"])
 
     def test_creator_processing_records_unexpected_work_failure_and_continues_remaining_works(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -869,6 +1053,10 @@ class PipelineHelpersTest(unittest.TestCase):
     def test_parser_accepts_feishu_only(self):
         args = PIPELINE.build_parser().parse_args(["--feishu-only"])
         self.assertTrue(args.feishu_only)
+
+    def test_parser_defaults_creator_collection_workers_to_three(self):
+        args = PIPELINE.build_parser().parse_args([])
+        self.assertEqual(args.collect_workers, 3)
 
     def test_feishu_only_preserves_persisted_backup_statuses(self):
         with tempfile.TemporaryDirectory() as directory:

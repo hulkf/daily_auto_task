@@ -1895,6 +1895,18 @@ def process_creator_phase_safely(
         return result
 
 
+def collection_context_error(context: dict[str, Any]) -> str | None:
+    """Return the collection failure reason carried by a normal phase result."""
+    result = context.get("result")
+    if not isinstance(result, dict):
+        return "采集阶段返回了无效结果"
+    if context.get("collection_ok") is False:
+        return str(result.get("collection_error") or "采集阶段返回 collection_ok=false")
+    if result.get("status") in {"failed", "partial_failure"} and result.get("collection_error"):
+        return str(result["collection_error"])
+    return None
+
+
 def process_creator(
     config: dict[str, Any], creator: dict[str, Any], runner: Runner,
     logger: Logger, env: dict[str, str], args: argparse.Namespace,
@@ -1909,6 +1921,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--creator", action="append", default=[], help="只运行指定达人 key，可重复")
     parser.add_argument("--aweme-id", action="append", default=[], help="只处理指定作品 ID，可重复")
     parser.add_argument("--max-works", type=int, default=None, help="每个达人最多处理条数；0 表示不限")
+    parser.add_argument(
+        "--collect-workers", type=int, default=3,
+        help="达人信息采集并发数；默认为 3，并发失败后逐个串行重试",
+    )
     parser.add_argument(
         "--asr-workers", type=int, default=None,
         help="视频转音频和 ASR 并发数；默认读取 asr.max_workers，未配置时为 4",
@@ -2006,46 +2022,107 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     summary["creators"].append(creator_result)
         else:
-            # Collection is a single serial producer. Transcript work is a separate
-            # single-consumer queue, so creator B collection can overlap creator A
-            # processing without mixing transcript batches between creators.
-            scheduled: list[tuple[dict[str, Any], Any | None, dict[str, Any] | None]] = []
-            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="creator-transcripts") as executor:
+            collect_workers = int(args.collect_workers)
+            if collect_workers < 1:
+                raise PipelineError("--collect-workers 必须至少为 1。")
+
+            # Creator collection is a bounded parallel producer. Successful creators
+            # enter the single-consumer transcript queue immediately. Only creators
+            # that fail the parallel attempt are retried once, serially, after the
+            # initial collection batch has settled.
+            collection_failures: dict[str, tuple[Exception, float]] = {}
+            collection_results: dict[str, dict[str, Any]] = {}
+            processing_futures: dict[str, Any] = {}
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="creator-transcripts") as transcript_executor:
+                worker_count = min(collect_workers, len(creators))
+                with ThreadPoolExecutor(
+                    max_workers=worker_count, thread_name_prefix="creator-collection",
+                ) as collection_executor:
+                    collection_started: dict[Any, float] = {}
+                    future_creators: dict[Any, dict[str, Any]] = {}
+                    for creator in creators:
+                        future = collection_executor.submit(
+                            collect_creator_phase, config, creator, runner, logger, env, args,
+                        )
+                        collection_started[future] = time.perf_counter()
+                        future_creators[future] = creator
+
+                    for future in as_completed(future_creators):
+                        creator = future_creators[future]
+                        key = creator_key(creator)
+                        attempt_seconds = time.perf_counter() - collection_started[future]
+                        try:
+                            context = future.result()
+                        except Exception as exc:
+                            collection_failures[key] = (exc, attempt_seconds)
+                            logger.write(f"达人并发采集失败 {key}: {exc}")
+                            continue
+                        context_error = collection_context_error(context)
+                        if context_error is not None:
+                            collection_failures[key] = (PipelineError(context_error), attempt_seconds)
+                            logger.write(f"达人并发采集失败 {key}: {context_error}")
+                            continue
+                        result = context["result"]
+                        result["collection_attempts"] = 1
+                        result["fallback_to_serial"] = False
+                        result.setdefault("phase_timings", {})["parallel_collection_seconds"] = round(
+                            attempt_seconds, 3,
+                        )
+                        collection_results[key] = result
+                        processing_futures[key] = transcript_executor.submit(
+                            process_creator_phase_safely, config, context, runner, logger, env, args,
+                        )
+
                 for creator in creators:
-                    collection_started = time.perf_counter()
+                    key = creator_key(creator)
+                    failure = collection_failures.get(key)
+                    if failure is None:
+                        continue
+                    initial_error, parallel_seconds = failure
+                    logger.write(f"串行补采开始 {key}，并发失败原因: {initial_error}")
+                    retry_started = time.perf_counter()
                     try:
                         context = collect_creator_phase(config, creator, runner, logger, env, args)
                     except Exception as exc:
-                        logger.write(f"达人采集阶段失败 {creator_key(creator)}: {exc}")
-                        failed_result = {
-                            "key": creator_key(creator), "status": "failed",
-                            "error": str(exc), "works": [],
+                        retry_seconds = time.perf_counter() - retry_started
+                        logger.write(f"达人串行补采失败 {key}: {exc}")
+                        collection_results[key] = {
+                            "key": key, "status": "failed", "error": str(exc), "works": [],
+                            "collection_attempts": 2, "fallback_to_serial": True,
+                            "parallel_collection_error": str(initial_error),
                             "phase_timings": {
-                                "collection_and_sync_seconds": round(
-                                    time.perf_counter() - collection_started, 3,
-                                ),
+                                "parallel_collection_seconds": round(parallel_seconds, 3),
+                                "serial_retry_seconds": round(retry_seconds, 3),
+                                "collection_and_sync_seconds": round(parallel_seconds + retry_seconds, 3),
                             },
                         }
-                        scheduled.append((creator, None, failed_result))
-                    else:
-                        future = executor.submit(
-                            process_creator_phase_safely, config, context, runner, logger, env, args,
-                        )
-                        scheduled.append((creator, future, None))
-
-                for creator, future, immediate_result in scheduled:
-                    if immediate_result is not None:
-                        summary["creators"].append(immediate_result)
                         continue
-                    try:
-                        creator_result = future.result()
-                    except Exception as exc:
-                        logger.write(f"达人文案处理失败 {creator_key(creator)}: {exc}")
-                        creator_result = {
-                            "key": creator_key(creator), "status": "failed",
-                            "error": str(exc), "works": [],
-                        }
-                    summary["creators"].append(creator_result)
+
+                    retry_seconds = time.perf_counter() - retry_started
+                    result = context["result"]
+                    timings = result.setdefault("phase_timings", {})
+                    timings["parallel_collection_seconds"] = round(parallel_seconds, 3)
+                    timings["serial_retry_seconds"] = round(retry_seconds, 3)
+                    timings["collection_and_sync_seconds"] = round(parallel_seconds + retry_seconds, 3)
+                    result["collection_attempts"] = 2
+                    result["fallback_to_serial"] = True
+                    result["parallel_collection_error"] = str(initial_error)
+                    collection_results[key] = result
+                    retry_error = collection_context_error(context)
+                    if retry_error is not None:
+                        logger.write(f"达人串行补采失败 {key}: {retry_error}")
+                        continue
+                    processing_futures[key] = transcript_executor.submit(
+                        process_creator_phase_safely, config, context, runner, logger, env, args,
+                    )
+
+                for creator in creators:
+                    key = creator_key(creator)
+                    future = processing_futures.get(key)
+                    if future is None:
+                        summary["creators"].append(collection_results[key])
+                    else:
+                        summary["creators"].append(future.result())
 
         summary["finished_at"] = now_text()
         summary["wall_seconds"] = round(time.perf_counter() - wall_started, 3)

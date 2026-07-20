@@ -176,3 +176,9 @@ python douyin_creator_monitor\scripts\run_three_creator_backfill.py
 飞书最终写回使用 Base `records/batch_update`，每批最多 200 条，不再在单个子进程中逐条 upsert。夸克逐作品、飞书逐批次原子保存带 `batch_id` 的 checkpoint，中断恢复时只接受当前批次结果。达人级 `phase_timings` 记录夸克和飞书真实批次墙钟耗时；作品级耗时按批次作品数分摊并保留原始 `batch_duration_seconds`，避免性能统计重复放大。
 
 真实运行确认：本机 `lark-cli 1.0.69` 的 `--data @file` 虽出现在帮助文本中，但批量请求会解析失败；批量 JSON 必须通过 stdin 配合 `--data -` 传入。Base 日期字段使用 Unix 毫秒时间戳，不能把 `YYYY-MM-DD HH:mm:ss` 字符串直接交给原生 `records/batch_update`，否则会返回 `DatetimeFieldConvFail (1254064)`。
+
+## 2026-07-20 达人采集并发策略
+
+主流水线的信息采集默认并发数调整为 3。每次 MediaCrawler 运行的 bootstrap 放在该达人本次独立输出目录中，禁止多个采集进程共享和覆盖同一个启动文件。首轮并发失败的达人仅在并发批次结束后逐个串行补采一次；首轮成功达人不重复采集。文案处理仍使用单消费者按达人串行，采集成功即可进入文案队列。摘要新增采集尝试次数、是否串行降级、并发采集耗时和串行补采耗时。
+
+真实调度还必须把采集阶段“正常返回但 result.status=partial_failure/failed 且带 collection_error”视为采集失败，不能只依赖 Future 抛异常；串行补采返回后也要做同样检查，失败时不得进入文案队列。2026-07-20 真实三达人验证 run_id=20260720-100054：首轮 3 并发，知了和阿笠首轮失败后串行补采成功，糯米爸首轮成功未重跑，总墙钟 754.895 秒。

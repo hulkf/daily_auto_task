@@ -490,8 +490,7 @@ def run_mediacrawler(
     output_dir.mkdir(parents=True, exist_ok=True)
     report_file = output_dir / "_collection_report.json"
 
-    bootstrap = PROJECT_DIR / "runtime" / "run_mediacrawler_douyin_creator.py"
-    bootstrap.parent.mkdir(parents=True, exist_ok=True)
+    bootstrap = output_dir / "_run_mediacrawler_douyin_creator.py"
     creator_id = creator_id_from_url(args.creator_url)
     bootstrap.write_text(
         "\n".join(

@@ -1,8 +1,10 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "scripts" / "collect_douyin_creator_with_mediacrawler.py"
@@ -88,6 +90,45 @@ class IncrementalCollectionTest(unittest.TestCase):
         self.assertEqual(COLLECTOR.determine_collection_mode(state, "creator-1", works, True), "full")
         self.assertEqual(COLLECTOR.determine_collection_mode(state, "creator-1", [], False), "full")
 
+
+    def test_parallel_mediacrawler_runs_use_independent_bootstrap_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            media = root / "MediaCrawler"
+            media.mkdir()
+            (media / "main.py").write_text("", encoding="utf-8")
+            commands = []
+
+            def run_external(command, **kwargs):
+                commands.append(command)
+                return argparse.Namespace(returncode=0)
+
+            def invoke(key):
+                args = argparse.Namespace(
+                    media_crawler_dir=str(media),
+                    media_crawler_python=sys.executable,
+                    media_output_dir=str(root / f"output-{key}"),
+                    clean_media_output=False,
+                    creator_url=f"creator-{key}",
+                    max_count=200,
+                    save_data_option="jsonl",
+                    login_type="qrcode",
+                    incremental_probe_count=3,
+                )
+                return COLLECTOR.run_mediacrawler(args, mode="incremental", known_ids=set())
+
+            with patch.object(COLLECTOR, "PROJECT_DIR", root), patch.object(
+                COLLECTOR, "RUNTIME_DIR", root / "runtime",
+            ), patch.object(COLLECTOR.subprocess, "run", side_effect=run_external):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    results = list(executor.map(invoke, ("a", "b")))
+
+            bootstrap_paths = [Path(command[1]) for command in commands]
+            self.assertEqual(len(set(bootstrap_paths)), 2)
+            self.assertEqual(
+                {path.parent for path in bootstrap_paths},
+                {output_dir for output_dir, _ in results},
+            )
 
     def test_generated_mediacrawler_patch_stops_at_known_boundary(self):
         with tempfile.TemporaryDirectory() as directory:

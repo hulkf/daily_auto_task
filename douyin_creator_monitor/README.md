@@ -258,3 +258,11 @@ python .\scripts\run_creator_pipeline.py --creator aligc --feishu-only
 - 飞书最终文案、IMA 状态、夸克状态、本地知识库状态和最后更新时间按达人调用 Base `records/batch_update` 真正批量写回，每批最多 200 条；批次 checkpoint 支持部分成功和失败项精确续跑。
 - 夸克和飞书的真实批次墙钟耗时记录在达人级 `phase_timings`；作品级 `duration_seconds` 按批次作品数分摊，同时保留 `batch_duration_seconds`，避免汇总时把同一批次耗时重复放大。
 - 达人之间的文案处理仍严格串行：当前达人全部作品成功或明确失败后，才进入下一达人。
+
+## 2026-07 达人并发采集与串行降级
+
+- 信息采集默认使用 3 个并发 worker，可通过 `--collect-workers N` 调整；`--fail-fast` 模式仍保持严格串行和立即停止语义。
+- 每个达人使用独立的 MediaCrawler 输出目录、采集状态和运行 bootstrap，避免并发时配置或产物互相覆盖。
+- 首轮并发采集失败的达人会在其他并发任务结束后逐个串行补采一次；成功达人不会重复采集。
+- 采集成功的达人立即进入单消费者文案队列，达人之间的文案处理仍严格串行，同一达人内部 ASR 仍按配置并发。
+- 运行摘要记录 `collection_attempts`、`fallback_to_serial`、`parallel_collection_seconds` 和可选的 `serial_retry_seconds`。
