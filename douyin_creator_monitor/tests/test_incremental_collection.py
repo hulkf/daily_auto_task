@@ -114,6 +114,8 @@ class IncrementalCollectionTest(unittest.TestCase):
                     save_data_option="jsonl",
                     login_type="qrcode",
                     incremental_probe_count=3,
+                    browser_profile_key=f"creator-{key}",
+                    cdp_port=9222 if key == "a" else 9232,
                 )
                 return COLLECTOR.run_mediacrawler(args, mode="incremental", known_ids=set())
 
@@ -129,6 +131,21 @@ class IncrementalCollectionTest(unittest.TestCase):
                 {path.parent for path in bootstrap_paths},
                 {output_dir for output_dir, _ in results},
             )
+            bootstrap_texts = [path.read_text(encoding="utf-8") for path in bootstrap_paths]
+            self.assertEqual(
+                {line for text in bootstrap_texts for line in text.splitlines() if line.startswith("config.CDP_DEBUG_PORT")},
+                {"config.CDP_DEBUG_PORT = 9222", "config.CDP_DEBUG_PORT = 9232"},
+            )
+            self.assertEqual(
+                {line for text in bootstrap_texts for line in text.splitlines() if line.startswith("config.USER_DATA_DIR")},
+                {
+                    "config.USER_DATA_DIR = 'creator-a_%s_user_data_dir'",
+                    "config.USER_DATA_DIR = 'creator-b_%s_user_data_dir'",
+                },
+            )
+            self.assertTrue(all("config.CDP_CONNECT_EXISTING = False" in text for text in bootstrap_texts))
+            self.assertTrue(all("kwargs.setdefault('wait_until', 'domcontentloaded')" in text for text in bootstrap_texts))
+            self.assertTrue(all("_page_goto_with_retry" in text for text in bootstrap_texts))
 
     def test_generated_mediacrawler_patch_stops_at_known_boundary(self):
         with tempfile.TemporaryDirectory() as directory:

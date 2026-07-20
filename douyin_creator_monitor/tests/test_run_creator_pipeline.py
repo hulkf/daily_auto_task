@@ -939,7 +939,13 @@ class PipelineHelpersTest(unittest.TestCase):
     def test_collect_command_passes_incremental_state_and_probe(self):
         config = {
             "python": "python",
-            "collection": {"incremental_probe_count": 3, "incremental_enabled": True},
+            "collection": {
+                "incremental_probe_count": 3,
+                "incremental_enabled": True,
+                "cdp_port_start": 9222,
+                "cdp_port_stride": 10,
+            },
+            "creators": [{"key": "a"}, {"key": "b"}, {"key": "demo"}],
         }
         creator = {"key": "demo", "creator_url": "creator-id"}
         command = PIPELINE.collect_command(
@@ -954,6 +960,8 @@ class PipelineHelpersTest(unittest.TestCase):
         self.assertIn("collection-state.json", command)
         self.assertIn("--incremental-probe-count", command)
         self.assertNotIn("--force-full-collect", command)
+        self.assertEqual(command[command.index("--browser-profile-key") + 1], "demo")
+        self.assertEqual(command[command.index("--cdp-port") + 1], "9242")
 
         forced = PIPELINE.collect_command(
             config,

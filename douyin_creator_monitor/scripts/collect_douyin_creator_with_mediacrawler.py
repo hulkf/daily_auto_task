@@ -62,6 +62,14 @@ def creator_id_from_url(value: str) -> str:
     return value.rstrip("/")
 
 
+def safe_browser_profile_key(value: str) -> str:
+    """Return a stable profile directory component without path traversal characters."""
+
+    normalized = "".join(char if char.isalnum() or char in "-_." else "_" for char in value.strip())
+    normalized = normalized.strip(" ._")
+    return normalized if normalized not in {"", ".", ".."} else "creator"
+
+
 def resolve_media_crawler_dir(value: str | None) -> Path:
     media_dir = Path(value or os.environ.get("MEDIACRAWLER_DIR", "")).expanduser()
     if not str(media_dir) or not (media_dir / "main.py").exists():
@@ -492,6 +500,12 @@ def run_mediacrawler(
 
     bootstrap = output_dir / "_run_mediacrawler_douyin_creator.py"
     creator_id = creator_id_from_url(args.creator_url)
+    browser_profile_key = safe_browser_profile_key(
+        str(getattr(args, "browser_profile_key", "") or creator_id)
+    )
+    cdp_port = int(getattr(args, "cdp_port", 9222))
+    if not 1 <= cdp_port <= 65535:
+        raise SystemExit("--cdp-port must be between 1 and 65535")
     bootstrap.write_text(
         "\n".join(
             [
@@ -500,6 +514,24 @@ def run_mediacrawler(
                 f"media_dir = Path({str(media_dir)!r})",
                 "sys.path.insert(0, str(media_dir))",
                 "import config",
+                "config.ENABLE_CDP_MODE = True",
+                "config.CDP_CONNECT_EXISTING = False",
+                f"config.CDP_DEBUG_PORT = {cdp_port}",
+                f"config.USER_DATA_DIR = {f'{browser_profile_key}_%s_user_data_dir'!r}",
+                f"print('[collector] isolated browser profile={browser_profile_key} cdp_port_start={cdp_port}')",
+                "from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError",
+                "_original_page_goto = Page.goto",
+                "async def _page_goto_with_retry(self, url, **kwargs):",
+                "    kwargs.setdefault('wait_until', 'domcontentloaded')",
+                "    kwargs.setdefault('timeout', 45000)",
+                "    for attempt in range(3):",
+                "        try:",
+                "            return await _original_page_goto(self, url, **kwargs)",
+                "        except PlaywrightTimeoutError:",
+                "            if attempt == 2:",
+                "                raise",
+                "            await asyncio.sleep(2 ** attempt)",
+                "Page.goto = _page_goto_with_retry",
                 "from media_platform.douyin.core import DouYinCrawler",
                 "from media_platform.douyin.client import DouYinClient",
                 "_original_create_douyin_client = DouYinCrawler.create_douyin_client",
@@ -688,12 +720,22 @@ def main() -> int:
     parser.add_argument("--max-count", type=int, default=200)
     parser.add_argument("--expect-min-count", type=int, default=1)
     parser.add_argument("--login-type", default="qrcode", choices=["qrcode", "phone", "cookie"])
+    parser.add_argument(
+        "--browser-profile-key",
+        help="Stable per-creator browser profile key; login state persists in MediaCrawler/browser_data.",
+    )
+    parser.add_argument(
+        "--cdp-port", type=int, default=9222,
+        help="Per-run CDP starting port. MediaCrawler selects the next free port when needed.",
+    )
     parser.add_argument("--save-data-option", default="jsonl", choices=["jsonl", "json", "csv"])
     parser.add_argument("--normalize-only", action="store_true", help="Skip running MediaCrawler; only normalize existing output files.")
     parser.add_argument("--clean-media-output", action="store_true")
     args = parser.parse_args()
     if args.incremental_probe_count < 1:
         parser.error("--incremental-probe-count must be at least 1")
+    if not 1 <= args.cdp_port <= 65535:
+        parser.error("--cdp-port must be between 1 and 65535")
     payload = collect(args)
     print(json.dumps({
         "output_file": str(Path(args.output_file)),

@@ -513,6 +513,18 @@ def child_env(config: dict[str, Any]) -> dict[str, str]:
     return env
 
 
+def collection_slot(config: dict[str, Any], creator: dict[str, Any]) -> int:
+    """Return the creator's stable zero-based slot in configured order."""
+
+    target = creator_key(creator)
+    configured = config.get("creators", [])
+    if isinstance(configured, list):
+        for index, item in enumerate(configured):
+            if isinstance(item, dict) and creator_key(item) == target:
+                return index
+    return 0
+
+
 def collect_command(
     config: dict[str, Any], creator: dict[str, Any], works_file: Path,
     media_output: Path, collection_state_file: Path, normalize_only: bool,
@@ -522,6 +534,17 @@ def collect_command(
     creator_url = str(creator.get("creator_url") or "").strip()
     if not creator_url:
         raise PipelineError(f"达人 {creator_key(creator)} 缺少 creator_url。")
+    profile_key = str(chosen(creator, defaults, "browser_profile_key", creator_key(creator)))
+    try:
+        port_start = int(chosen(creator, defaults, "cdp_port_start", 9222))
+        port_stride = int(chosen(creator, defaults, "cdp_port_stride", 10))
+        cdp_port = int(chosen(creator, defaults, "cdp_port", port_start + collection_slot(config, creator) * port_stride))
+    except (TypeError, ValueError) as exc:
+        raise PipelineError("collection.cdp_port_start/cdp_port_stride/cdp_port 必须是整数。") from exc
+    if port_stride < 1:
+        raise PipelineError("collection.cdp_port_stride 必须至少为 1。")
+    if not 1 <= cdp_port <= 65535:
+        raise PipelineError(f"达人 {creator_key(creator)} 的 CDP 端口超出 1-65535: {cdp_port}")
     command = py(
         config, "collect_douyin_creator_with_mediacrawler.py",
         "--creator-url", creator_url,
@@ -532,6 +555,8 @@ def collect_command(
         "--max-count", chosen(creator, defaults, "max_count", 200),
         "--expect-min-count", chosen(creator, defaults, "expect_min_count", 1),
         "--login-type", chosen(creator, defaults, "login_type", "qrcode"),
+        "--browser-profile-key", profile_key,
+        "--cdp-port", cdp_port,
         "--save-data-option", chosen(creator, defaults, "save_data_option", "jsonl"),
     )
     append_option(command, "--media-crawler-dir", chosen(creator, defaults, "media_crawler_dir"))

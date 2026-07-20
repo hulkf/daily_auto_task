@@ -262,7 +262,10 @@ python .\scripts\run_creator_pipeline.py --creator aligc --feishu-only
 ## 2026-07 达人并发采集与串行降级
 
 - 信息采集默认使用 3 个并发 worker，可通过 `--collect-workers N` 调整；`--fail-fast` 模式仍保持严格串行和立即停止语义。
-- 每个达人使用独立的 MediaCrawler 输出目录、采集状态和运行 bootstrap，避免并发时配置或产物互相覆盖。
+- 每个达人使用独立的 MediaCrawler 输出目录、采集状态、运行 bootstrap 和持久化浏览器 profile，避免并发时配置、产物或 Chromium profile 锁互相冲突；首次创建新 profile 时可能需要重新确认登录授权。
+- 每个达人使用独立临时 CDP 端口。默认从 `collection.cdp_port_start=9222` 开始，按配置中的达人顺序以 `collection.cdp_port_stride=10` 递增；例如前三位达人使用 `9222/9232/9242`。也可在达人配置中用 `browser_profile_key` 和 `cdp_port` 单独覆盖。
+- 浏览器和 CDP 端口只在该达人采集期间占用；采集进程退出后自动释放。串行补采复用该达人原有 profile 和端口，不创建新的登录环境。
 - 首轮并发采集失败的达人会在其他并发任务结束后逐个串行补采一次；成功达人不会重复采集。
 - 采集成功的达人立即进入单消费者文案队列，达人之间的文案处理仍严格串行，同一达人内部 ASR 仍按配置并发。
 - 运行摘要记录 `collection_attempts`、`fallback_to_serial`、`parallel_collection_seconds` 和可选的 `serial_retry_seconds`。
+- 2026-07-20 真实三达人并发验证 `run_id=20260720-121425`：首轮 3/3 成功，均为 `collection_attempts=1`、`fallback_to_serial=false`；墙钟耗时 `105.795` 秒，相比隔离前基准 `725.965` 秒减少约 `85.43%`。本轮没有新增作品，因此未触发 ASR 和交付阶段。
